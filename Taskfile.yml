@@ -1,0 +1,80 @@
+version: "3"
+
+tasks:
+  default:
+    desc: Build the project
+    cmds:
+      - cargo build
+
+  build:
+    desc: Build the project
+    cmds:
+      - cargo build
+
+  release:
+    desc: Build in release mode
+    cmds:
+      - cargo build --release
+
+  test:
+    desc: Run tests with nextest
+    cmds:
+      - cargo nextest run
+
+  coverage:
+    desc: Generate code coverage with cargo-llvm-cov
+    cmds:
+      - cargo llvm-cov nextest --html
+    generates:
+      - target/llvm-cov/html/**
+
+  coverage-text:
+    desc: Show code coverage summary in terminal
+    cmds:
+      - cargo llvm-cov nextest
+
+  coverage-lcov:
+    desc: Generate LCOV coverage report
+    cmds:
+      - cargo llvm-cov nextest --lcov --output-path target/llvm-cov/lcov.info
+
+  fmt:
+    desc: Format code
+    cmds:
+      - cargo fmt
+
+  fmt-check:
+    desc: Check formatting
+    cmds:
+      - cargo fmt --check
+
+  clippy:
+    desc: Run clippy lints
+    cmds:
+      - cargo clippy -- -D warnings
+
+  audit:
+    desc: Run security audit
+    cmds:
+      - cargo audit
+
+  check:
+    desc: Run fmt-check, clippy, audit, and tests
+    cmds:
+      - task: fmt-check
+      - task: clippy
+      - task: audit
+      - task: test
+
+  pre-commit:
+    desc: Run fmt, clippy, audit, and tests before committing
+    cmds:
+      - task: fmt
+      - task: clippy
+      - task: audit
+      - task: test
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
