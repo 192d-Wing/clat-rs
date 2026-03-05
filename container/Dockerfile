@@ -1,4 +1,4 @@
-FROM rust:1.93-trixie AS builder
+FROM dhi.io/rust:1.93 AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -6,7 +6,7 @@ COPY src/ src/
 
 RUN cargo build --release
 
-FROM debian:trixie-slim
+FROM dhi.io/debian-base:trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
