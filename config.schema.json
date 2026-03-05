@@ -5,7 +5,7 @@
   "type": "object",
   "required": [
     "clat_ipv4_addr",
-    "clat_ipv4_network",
+    "clat_ipv4_networks",
     "clat_v6_prefix",
     "plat_v6_prefix",
     "uplink_interface"
@@ -18,11 +18,15 @@
       "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$",
       "examples": ["192.168.1.1"]
     },
-    "clat_ipv4_network": {
-      "type": "string",
-      "description": "IPv4 subnet served by the CLAT in CIDR notation",
-      "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)/(3[0-2]|[12]?\\d)$",
-      "examples": ["192.168.1.0/24"]
+    "clat_ipv4_networks": {
+      "type": "array",
+      "description": "IPv4 subnets served by the CLAT in CIDR notation. At least one subnet is required.",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)/(3[0-2]|[12]?\\d)$"
+      },
+      "examples": [["192.168.1.0/24"], ["10.0.0.0/24", "172.16.0.0/24"]]
     },
     "clat_v6_prefix": {
       "type": "string",

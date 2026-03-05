@@ -8,8 +8,8 @@ pub struct Config {
     /// IPv4 address for the CLAT TUN interface
     pub clat_ipv4_addr: Ipv4Addr,
 
-    /// IPv4 subnet for LAN (e.g., "192.168.1.0/24")
-    pub clat_ipv4_network: String,
+    /// IPv4 subnets for LAN (e.g., ["192.168.1.0/24", "10.0.0.0/24"])
+    pub clat_ipv4_networks: Vec<String>,
 
     /// /96 IPv6 prefix for CLAT-side embedding (source)
     pub clat_v6_prefix: String,
@@ -38,12 +38,14 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        // Parse and validate CLAT prefix
         self.parse_v6_prefix(&self.clat_v6_prefix)?;
-        // Parse and validate PLAT prefix
         self.parse_v6_prefix(&self.plat_v6_prefix)?;
-        // Validate network CIDR
-        self.parse_ipv4_network()?;
+        if self.clat_ipv4_networks.is_empty() {
+            anyhow::bail!("clat_ipv4_networks must contain at least one subnet");
+        }
+        for network in &self.clat_ipv4_networks {
+            parse_ipv4_cidr(network)?;
+        }
         Ok(())
     }
 
@@ -61,18 +63,12 @@ impl Config {
         Ok(addr)
     }
 
-    /// Parse the IPv4 network CIDR, returning (network addr, prefix length).
-    pub fn parse_ipv4_network(&self) -> anyhow::Result<(Ipv4Addr, u8)> {
-        let parts: Vec<&str> = self.clat_ipv4_network.split('/').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("invalid IPv4 network format: {}", self.clat_ipv4_network);
-        }
-        let addr: Ipv4Addr = parts[0].parse()?;
-        let prefix_len: u8 = parts[1].parse()?;
-        if prefix_len > 32 {
-            anyhow::bail!("invalid IPv4 prefix length: {prefix_len}");
-        }
-        Ok((addr, prefix_len))
+    /// Parse all configured IPv4 networks, returning (network addr, prefix length) pairs.
+    pub fn parse_ipv4_networks(&self) -> anyhow::Result<Vec<(Ipv4Addr, u8)>> {
+        self.clat_ipv4_networks
+            .iter()
+            .map(|n| parse_ipv4_cidr(n))
+            .collect()
     }
 
     pub fn clat_prefix(&self) -> Ipv6Addr {
@@ -82,4 +78,18 @@ impl Config {
     pub fn plat_prefix(&self) -> Ipv6Addr {
         self.parse_v6_prefix(&self.plat_v6_prefix).unwrap()
     }
+}
+
+/// Parse an IPv4 CIDR string, returning (network addr, prefix length).
+fn parse_ipv4_cidr(cidr: &str) -> anyhow::Result<(Ipv4Addr, u8)> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid IPv4 network format: {cidr}");
+    }
+    let addr: Ipv4Addr = parts[0].parse()?;
+    let prefix_len: u8 = parts[1].parse()?;
+    if prefix_len > 32 {
+        anyhow::bail!("invalid IPv4 prefix length: {prefix_len}");
+    }
+    Ok((addr, prefix_len))
 }

@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,18 +13,24 @@ const BUF_SIZE: usize = 65536;
 
 /// Run the main CLAT packet translation loop.
 pub async fn run(config: &Config) -> anyhow::Result<()> {
-    let (network_addr, prefix_len) = config.parse_ipv4_network()?;
-    let clat_prefix = config.clat_prefix();
-    let plat_prefix = config.plat_prefix();
+    let networks: Vec<(Ipv4Addr, u8)> = config.parse_ipv4_networks()?;
+    let clat_prefix: Ipv6Addr = config.clat_prefix();
+    let plat_prefix: Ipv6Addr = config.plat_prefix();
 
-    // Create TUN device
+    // Create TUN device using the first network for the interface address
+    let (first_network, first_prefix_len) = networks[0];
     let mut tun_dev = tun_device::create_tun(
         TUN_NAME,
         config.clat_ipv4_addr,
-        network_addr,
-        prefix_len,
+        first_network,
+        first_prefix_len,
         config.mtu,
     )?;
+
+    // Log additional networks (routes would be added via ip route in production)
+    for (net, prefix) in &networks[1..] {
+        log::info!("additional CLAT network: {net}/{prefix}");
+    }
 
     // Bind a raw IPv6 socket for sending/receiving translated packets.
     // We use a UDP socket bound to [::]:0 as a placeholder — in production
@@ -34,8 +41,8 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
 
     log::info!("CLAT packet loop started on {TUN_NAME}");
 
-    let mut tun_buf = [0u8; BUF_SIZE];
-    let mut raw_buf = [0u8; BUF_SIZE];
+    let mut tun_buf: [u8; 65536] = [0u8; BUF_SIZE];
+    let mut raw_buf: [u8; 65536] = [0u8; BUF_SIZE];
 
     loop {
         tokio::select! {
@@ -111,9 +118,9 @@ async fn send_ipv6_packet(sock: &std::net::UdpSocket, packet: &[u8]) -> anyhow::
     }
 
     // Extract destination IPv6 from the packet header
-    let mut dst_bytes = [0u8; 16];
+    let mut dst_bytes: [u8; 16] = [0u8; 16];
     dst_bytes.copy_from_slice(&packet[24..40]);
-    let dst = Ipv6Addr::from(dst_bytes);
+    let dst: Ipv6Addr = Ipv6Addr::from(dst_bytes);
 
     // For raw sockets this would be sendto() with the raw packet.
     // With UDP placeholder, we send to the destination.
