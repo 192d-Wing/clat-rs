@@ -53,3 +53,61 @@ impl SharedState {
         self.translating.store(val, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_with_initial_prefix() {
+        let prefix: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let plat: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = SharedState::new(Some(prefix), plat, "eth0".to_string());
+        assert_eq!(state.current_prefix(), Some(prefix));
+        assert_eq!(state.plat_prefix, plat);
+        assert!(!state.is_translating());
+    }
+
+    #[test]
+    fn test_new_without_initial_prefix() {
+        let plat: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = SharedState::new(None, plat, "eth0".to_string());
+        assert_eq!(state.current_prefix(), None);
+    }
+
+    #[test]
+    fn test_set_prefix() {
+        let plat: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = SharedState::new(None, plat, "eth0".to_string());
+        assert_eq!(state.current_prefix(), None);
+
+        let new_prefix: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        state.set_prefix(new_prefix);
+        assert_eq!(state.current_prefix(), Some(new_prefix));
+    }
+
+    #[test]
+    fn test_subscribe_prefix() {
+        let plat: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = SharedState::new(None, plat, "eth0".to_string());
+        let rx = state.subscribe_prefix();
+        assert_eq!(*rx.borrow(), None);
+
+        let prefix: Ipv6Addr = "2001:db8::".parse().unwrap();
+        state.set_prefix(prefix);
+        assert_eq!(*rx.borrow(), Some(prefix));
+    }
+
+    #[test]
+    fn test_translating_flag() {
+        let plat: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = SharedState::new(None, plat, "eth0".to_string());
+        assert!(!state.is_translating());
+
+        state.set_translating(true);
+        assert!(state.is_translating());
+
+        state.set_translating(false);
+        assert!(!state.is_translating());
+    }
+}

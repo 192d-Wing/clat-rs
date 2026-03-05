@@ -170,4 +170,88 @@ mod tests {
         let v4 = icmpv6_to_icmpv4(v6.icmp_type, v6.icmp_code).unwrap();
         assert_eq!(v4.icmp_type, ICMPV4_ECHO_REQUEST);
     }
+
+    #[test]
+    fn test_dest_unreachable_v4_to_v6() {
+        // Net unreachable
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_NET_UNREACHABLE).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 0);
+
+        // Host unreachable
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_HOST_UNREACHABLE).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 0);
+
+        // Protocol unreachable -> port unreachable
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_PROTOCOL_UNREACHABLE).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 4);
+
+        // Port unreachable
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_PORT_UNREACHABLE).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 4);
+
+        // Source route failed
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_SRC_ROUTE_FAILED).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 0);
+
+        // Admin prohibited
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, ICMPV4_DU_ADMIN_PROHIBITED).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 1);
+
+        // Unknown code -> default
+        let m = icmpv4_to_icmpv6(ICMPV4_DEST_UNREACHABLE, 99).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_DEST_UNREACHABLE);
+        assert_eq!(m.icmp_code, 0);
+    }
+
+    #[test]
+    fn test_dest_unreachable_v6_to_v4() {
+        // No route -> net unreachable
+        let m = icmpv6_to_icmpv4(ICMPV6_DEST_UNREACHABLE, 0).unwrap();
+        assert_eq!(m.icmp_code, ICMPV4_DU_NET_UNREACHABLE);
+
+        // Admin prohibited
+        let m = icmpv6_to_icmpv4(ICMPV6_DEST_UNREACHABLE, 1).unwrap();
+        assert_eq!(m.icmp_code, ICMPV4_DU_ADMIN_PROHIBITED);
+
+        // Address unreachable -> host unreachable
+        let m = icmpv6_to_icmpv4(ICMPV6_DEST_UNREACHABLE, 3).unwrap();
+        assert_eq!(m.icmp_code, ICMPV4_DU_HOST_UNREACHABLE);
+
+        // Port unreachable
+        let m = icmpv6_to_icmpv4(ICMPV6_DEST_UNREACHABLE, 4).unwrap();
+        assert_eq!(m.icmp_code, ICMPV4_DU_PORT_UNREACHABLE);
+
+        // Unknown code -> default net unreachable
+        let m = icmpv6_to_icmpv4(ICMPV6_DEST_UNREACHABLE, 99).unwrap();
+        assert_eq!(m.icmp_code, ICMPV4_DU_NET_UNREACHABLE);
+    }
+
+    #[test]
+    fn test_time_exceeded() {
+        let m = icmpv4_to_icmpv6(ICMPV4_TIME_EXCEEDED, 0).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_TIME_EXCEEDED);
+        assert_eq!(m.icmp_code, 0);
+
+        let m = icmpv4_to_icmpv6(ICMPV4_TIME_EXCEEDED, 1).unwrap();
+        assert_eq!(m.icmp_type, ICMPV6_TIME_EXCEEDED);
+        assert_eq!(m.icmp_code, 1);
+
+        let m = icmpv6_to_icmpv4(ICMPV6_TIME_EXCEEDED, 0).unwrap();
+        assert_eq!(m.icmp_type, ICMPV4_TIME_EXCEEDED);
+        assert_eq!(m.icmp_code, 0);
+    }
+
+    #[test]
+    fn test_unsupported_types_dropped() {
+        // ICMPv4 type 9 (Router Advertisement) - not translated
+        assert!(icmpv4_to_icmpv6(9, 0).is_none());
+        // ICMPv6 type 130 (Multicast Listener Query) - not translated
+        assert!(icmpv6_to_icmpv4(130, 0).is_none());
+    }
 }

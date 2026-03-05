@@ -589,4 +589,378 @@ mod tests {
         assert_eq!(result_dst, src);
         assert_eq!(result[20], icmp::ICMPV4_ECHO_REPLY);
     }
+
+    // --- Edge-case tests for ipv4_to_ipv6 ---
+
+    #[test]
+    fn test_ipv4_to_ipv6_too_short() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        // Packet shorter than minimum IPv4 header
+        assert!(ipv4_to_ipv6(&[0x45; 10], clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_wrong_version() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x65; // version 6, not 4
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_truncated_total_len() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        // Total length claims 40 but we only have 20 bytes
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    // --- TCP translation tests ---
+
+    fn make_ipv4_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let tcp_len: usize = 20;
+        let total_len: u16 = (IPV4_HEADER_MIN_LEN + tcp_len) as u16;
+        let mut pkt = vec![0u8; total_len as usize];
+
+        // IPv4 header
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[6..8].copy_from_slice(&[0x40, 0x00]); // DF
+        pkt[8] = 64; // TTL
+        pkt[9] = PROTO_TCP;
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+
+        let hdr_cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        // TCP header (minimal SYN)
+        pkt[20] = 0x00;
+        pkt[21] = 0x50; // src port 80
+        pkt[22] = 0xC0;
+        pkt[23] = 0x01; // dst port 49153
+        // seq
+        pkt[24..28].copy_from_slice(&1u32.to_be_bytes());
+        // data offset (5 words = 20 bytes), SYN flag
+        pkt[32] = 0x50;
+        pkt[33] = 0x02; // SYN
+        pkt[34..36].copy_from_slice(&8192u16.to_be_bytes()); // window
+
+        // Compute TCP checksum
+        let pseudo = checksum::ipv4_pseudo_header_sum(src, dst, PROTO_TCP, tcp_len as u16);
+        let tcp_data = &pkt[20..];
+        let mut sum = pseudo;
+        let mut i = 0;
+        while i + 1 < tcp_data.len() {
+            sum += u32::from(u16::from_be_bytes([tcp_data[i], tcp_data[i + 1]]));
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let cksum = !(sum as u16);
+        pkt[36] = (cksum >> 8) as u8;
+        pkt[37] = (cksum & 0xFF) as u8;
+
+        pkt
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_tcp() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let pkt = make_ipv4_tcp_syn(src, dst);
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+
+        assert_eq!(v6[0] >> 4, 6); // IPv6
+        assert_eq!(v6[6], PROTO_TCP); // next header = TCP
+        assert_eq!(v6[7], 63); // hop limit
+
+        // Verify TCP payload is present (src port preserved)
+        assert_eq!(v6[40], 0x00);
+        assert_eq!(v6[41], 0x50); // port 80
+    }
+
+    #[test]
+    fn test_roundtrip_tcp() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let original = make_ipv4_tcp_syn(src, dst);
+        let v6 = ipv4_to_ipv6(&original, clat, plat).unwrap();
+
+        // Simulate a reply by swapping src/dst in IPv6
+        let mut reply = v6.clone();
+        let src_copy: [u8; 16] = reply[8..24].try_into().unwrap();
+        let dst_copy: [u8; 16] = reply[24..40].try_into().unwrap();
+        reply[8..24].copy_from_slice(&dst_copy);
+        reply[24..40].copy_from_slice(&src_copy);
+
+        // Recompute the TCP checksum from scratch
+        let new_src = Ipv6Addr::from(<[u8; 16]>::try_from(&reply[8..24]).unwrap());
+        let new_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&reply[24..40]).unwrap());
+        let tcp_payload_len = reply.len() - 40;
+        reply[56] = 0;
+        reply[57] = 0;
+        let pseudo =
+            checksum::ipv6_pseudo_header_sum(new_src, new_dst, PROTO_TCP, tcp_payload_len as u32);
+        let tcp_data = &reply[40..];
+        let mut sum = pseudo;
+        let mut i = 0;
+        while i + 1 < tcp_data.len() {
+            sum += u32::from(u16::from_be_bytes([tcp_data[i], tcp_data[i + 1]]));
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let cksum = !(sum as u16);
+        reply[56] = (cksum >> 8) as u8;
+        reply[57] = (cksum & 0xFF) as u8;
+
+        let result = ipv6_to_ipv4(&reply, clat, plat).unwrap();
+        assert_eq!(result[0] >> 4, 4);
+        assert_eq!(result[9], PROTO_TCP);
+    }
+
+    // --- UDP translation tests ---
+
+    fn make_ipv4_udp(src: Ipv4Addr, dst: Ipv4Addr, with_checksum: bool) -> Vec<u8> {
+        let udp_len: u16 = 12; // 8 header + 4 data
+        let total_len: u16 = IPV4_HEADER_MIN_LEN as u16 + udp_len;
+        let mut pkt = vec![0u8; total_len as usize];
+
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[6..8].copy_from_slice(&[0x40, 0x00]);
+        pkt[8] = 64;
+        pkt[9] = PROTO_UDP;
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+
+        let hdr_cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        // UDP header
+        pkt[20] = 0x13;
+        pkt[21] = 0x88; // src port 5000
+        pkt[22] = 0x00;
+        pkt[23] = 0x35; // dst port 53
+        pkt[24..26].copy_from_slice(&udp_len.to_be_bytes()); // length
+        // Data
+        pkt[28] = 0xDE;
+        pkt[29] = 0xAD;
+        pkt[30] = 0xBE;
+        pkt[31] = 0xEF;
+
+        if with_checksum {
+            pkt[26] = 0;
+            pkt[27] = 0;
+            let pseudo = checksum::ipv4_pseudo_header_sum(src, dst, PROTO_UDP, udp_len);
+            let udp_data = &pkt[20..];
+            let mut sum = pseudo;
+            let mut i = 0;
+            while i + 1 < udp_data.len() {
+                sum += u32::from(u16::from_be_bytes([udp_data[i], udp_data[i + 1]]));
+                i += 2;
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let cksum = !(sum as u16);
+            pkt[26] = (cksum >> 8) as u8;
+            pkt[27] = (cksum & 0xFF) as u8;
+        } else {
+            // Zero checksum (valid in IPv4 UDP)
+            pkt[26] = 0;
+            pkt[27] = 0;
+        }
+
+        pkt
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_udp_with_checksum() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let pkt = make_ipv4_udp(src, dst, true);
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+
+        assert_eq!(v6[0] >> 4, 6);
+        assert_eq!(v6[6], PROTO_UDP);
+        // UDP checksum should be non-zero in IPv6
+        let udp_cksum = u16::from_be_bytes([v6[46], v6[47]]);
+        assert_ne!(udp_cksum, 0);
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_udp_zero_checksum() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        // IPv4 UDP with zero checksum (must be computed for IPv6)
+        let pkt = make_ipv4_udp(src, dst, false);
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+
+        assert_eq!(v6[6], PROTO_UDP);
+        let udp_cksum = u16::from_be_bytes([v6[46], v6[47]]);
+        // Must be non-zero in IPv6
+        assert_ne!(udp_cksum, 0);
+    }
+
+    #[test]
+    fn test_roundtrip_udp() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let original = make_ipv4_udp(src, dst, true);
+        let v6 = ipv4_to_ipv6(&original, clat, plat).unwrap();
+
+        // Simulate reply by swapping src/dst
+        let mut reply = v6.clone();
+        let src_copy: [u8; 16] = reply[8..24].try_into().unwrap();
+        let dst_copy: [u8; 16] = reply[24..40].try_into().unwrap();
+        reply[8..24].copy_from_slice(&dst_copy);
+        reply[24..40].copy_from_slice(&src_copy);
+
+        // Recompute UDP checksum
+        let new_src = Ipv6Addr::from(<[u8; 16]>::try_from(&reply[8..24]).unwrap());
+        let new_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&reply[24..40]).unwrap());
+        let udp_len = reply.len() - 40;
+        reply[46] = 0;
+        reply[47] = 0;
+        let pseudo = checksum::ipv6_pseudo_header_sum(new_src, new_dst, PROTO_UDP, udp_len as u32);
+        let udp_data = &reply[40..];
+        let mut sum = pseudo;
+        let mut i = 0;
+        while i + 1 < udp_data.len() {
+            sum += u32::from(u16::from_be_bytes([udp_data[i], udp_data[i + 1]]));
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let cksum = !(sum as u16);
+        let cksum = if cksum == 0 { 0xFFFF } else { cksum };
+        reply[46] = (cksum >> 8) as u8;
+        reply[47] = (cksum & 0xFF) as u8;
+
+        let result = ipv6_to_ipv4(&reply, clat, plat).unwrap();
+        assert_eq!(result[0] >> 4, 4);
+        assert_eq!(result[9], PROTO_UDP);
+        // Data should survive
+        assert_eq!(result[28], 0xDE);
+        assert_eq!(result[29], 0xAD);
+    }
+
+    // --- IPv6 to IPv4 edge cases ---
+
+    #[test]
+    fn test_ipv6_to_ipv4_too_short() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        assert!(ipv6_to_ipv4(&[0x60; 20], clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_wrong_version() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45; // version 4
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_prefix_mismatch() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let wrong: Ipv6Addr = "2001:db8:ffff::".parse().unwrap();
+
+        // Build minimal valid IPv6 packet with wrong src prefix
+        let mut pkt = vec![0u8; 48]; // 40 header + 8 payload
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload len
+        pkt[6] = PROTO_TCP;
+        pkt[7] = 64;
+        // src = wrong prefix (should be plat)
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(wrong, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    // --- Unknown protocol passthrough ---
+
+    #[test]
+    fn test_ipv4_to_ipv6_unknown_protocol_passthrough() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let total_len: u16 = 24; // 20 header + 4 payload
+        let mut pkt = vec![0u8; total_len as usize];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 47; // GRE (not TCP/UDP/ICMP)
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+        let hdr_cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+        pkt[20..24].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+        assert_eq!(v6[6], 47); // GRE next header preserved
+        // Payload passed through unchanged
+        assert_eq!(&v6[40..44], &[0xCA, 0xFE, 0xBA, 0xBE]);
+    }
+
+    // --- ICMP too-short payload ---
+
+    #[test]
+    fn test_ipv4_to_ipv6_icmp_too_short() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        // ICMP payload too short (< 4 bytes)
+        let total_len: u16 = 22; // 20 header + 2 payload
+        let mut pkt = vec![0u8; total_len as usize];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = PROTO_ICMP;
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+        let hdr_cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
 }

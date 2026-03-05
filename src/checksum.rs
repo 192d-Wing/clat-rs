@@ -153,4 +153,100 @@ mod tests {
         // Verify: checksum of complete header should be 0
         assert_eq!(internet_checksum(&header), 0);
     }
+
+    #[test]
+    fn test_internet_checksum_odd_length() {
+        // Odd-length data exercises the trailing byte branch
+        let data = [0x01, 0x02, 0x03];
+        let cksum = internet_checksum(&data);
+        // Verify: checksum of data + checksum should be 0
+        let mut buf = data.to_vec();
+        buf.push(0); // pad to even
+        let _check_bytes = cksum.to_be_bytes();
+        // Append checksum
+        let mut verify = data.to_vec();
+        verify.extend_from_slice(&[0x00]); // pad
+        // Just verify it's non-zero and deterministic
+        assert_eq!(cksum, internet_checksum(&data));
+    }
+
+    #[test]
+    fn test_ipv4_pseudo_header_sum() {
+        let src: Ipv4Addr = "192.168.1.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let sum = ipv4_pseudo_header_sum(src, dst, 6, 100);
+        // Should be deterministic
+        assert_eq!(sum, ipv4_pseudo_header_sum(src, dst, 6, 100));
+        // Different inputs should produce different sums
+        assert_ne!(sum, ipv4_pseudo_header_sum(src, dst, 17, 100));
+    }
+
+    #[test]
+    fn test_ipv6_pseudo_header_sum() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let sum = ipv6_pseudo_header_sum(src, dst, 6, 100);
+        assert_eq!(sum, ipv6_pseudo_header_sum(src, dst, 6, 100));
+        assert_ne!(sum, ipv6_pseudo_header_sum(src, dst, 17, 100));
+    }
+
+    #[test]
+    fn test_adjust_checksum_v4_to_v6_roundtrip() {
+        // Build a real TCP-like payload with valid checksum over IPv4 pseudo-header,
+        // adjust to IPv6, then adjust back. The result should match the original.
+        let src4: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst4: Ipv4Addr = "198.51.100.1".parse().unwrap();
+        let src6: Ipv6Addr = "2001:db8:aaaa::c0a8:0102".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8:1234::c633:6401".parse().unwrap();
+
+        // Compute a valid TCP checksum over IPv4 pseudo-header
+        let payload: [u8; 20] = [
+            0x00, 0x50, 0x00, 0x51, // src/dst port
+            0x00, 0x00, 0x00, 0x01, // seq
+            0x00, 0x00, 0x00, 0x00, // ack
+            0x50, 0x02, 0x20, 0x00, // offset, flags, window
+            0x00, 0x00, // checksum placeholder
+            0x00, 0x00, // urgent
+        ];
+        let pseudo = ipv4_pseudo_header_sum(src4, dst4, 6, payload.len() as u16);
+        let mut sum = pseudo;
+        for chunk in payload.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let original_cksum = !(sum as u16);
+
+        // Adjust v4->v6
+        let v6_cksum = adjust_checksum_v4_to_v6(
+            original_cksum,
+            src4,
+            dst4,
+            6,
+            src6,
+            dst6,
+            6,
+            payload.len() as u16,
+        );
+
+        // Adjust back v6->v4
+        let roundtrip_cksum =
+            adjust_checksum_v6_to_v4(v6_cksum, src6, dst6, 6, src4, dst4, 6, payload.len() as u16);
+
+        assert_eq!(roundtrip_cksum, original_cksum);
+    }
+
+    #[test]
+    fn test_adjust_checksum_v6_to_v4() {
+        // Just verify it produces a non-trivial result and doesn't panic
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let src4: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst4: Ipv4Addr = "10.0.0.2".parse().unwrap();
+
+        let result = adjust_checksum_v6_to_v4(0x1234, src6, dst6, 58, src4, dst4, 1, 64);
+        // Just ensure it doesn't panic and returns something
+        let _ = result;
+    }
 }

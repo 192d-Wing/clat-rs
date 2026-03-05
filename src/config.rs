@@ -192,4 +192,162 @@ mod tests {
         assert!(derive_first_96_from_pd("2001:db8:aaaa::/128").is_err());
         assert!(derive_first_96_from_pd("2001:db8:aaaa::/97").is_err());
     }
+
+    #[test]
+    fn test_derive_rejects_invalid_format() {
+        assert!(derive_first_96_from_pd("2001:db8:aaaa::").is_err()); // no prefix len
+        assert!(derive_first_96_from_pd("not-an-address/48").is_err()); // bad addr
+    }
+
+    #[test]
+    fn test_parse_v6_prefix_96_valid() {
+        let addr = parse_v6_prefix_96("2001:db8:1234::/96").unwrap();
+        assert_eq!(addr, "2001:db8:1234::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_parse_v6_prefix_96_wrong_length() {
+        assert!(parse_v6_prefix_96("2001:db8::/64").is_err());
+        assert!(parse_v6_prefix_96("2001:db8::/128").is_err());
+    }
+
+    #[test]
+    fn test_parse_v6_prefix_96_invalid_format() {
+        assert!(parse_v6_prefix_96("2001:db8::").is_err()); // no /
+        assert!(parse_v6_prefix_96("bad/96").is_err()); // bad addr
+    }
+
+    #[test]
+    fn test_parse_ipv4_cidr_valid() {
+        let (addr, len) = parse_ipv4_cidr("192.168.1.0/24").unwrap();
+        assert_eq!(addr, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(len, 24);
+    }
+
+    #[test]
+    fn test_parse_ipv4_cidr_host() {
+        let (addr, len) = parse_ipv4_cidr("10.0.0.1/32").unwrap();
+        assert_eq!(addr, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(len, 32);
+    }
+
+    #[test]
+    fn test_parse_ipv4_cidr_invalid() {
+        assert!(parse_ipv4_cidr("192.168.1.0").is_err()); // no prefix
+        assert!(parse_ipv4_cidr("192.168.1.0/33").is_err()); // too long
+        assert!(parse_ipv4_cidr("bad/24").is_err()); // bad addr
+    }
+
+    #[test]
+    fn test_config_load_valid_explicit_prefix() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+clat_v6_prefix: "2001:db8:aaaa::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.mtu, 1400); // default
+        let prefix = config.clat_prefix().unwrap();
+        assert_eq!(prefix, "2001:db8:aaaa::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_config_load_valid_pd_prefix() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "10.0.0.0/8"
+dhcpv6_pd_prefix: "2001:db8:abcd::/48"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+mtu: 1280
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.mtu, 1280);
+        let prefix = config.clat_prefix().unwrap();
+        assert_eq!(prefix, "2001:db8:abcd::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_config_no_prefix_errors() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(config.clat_prefix().is_err());
+    }
+
+    #[test]
+    fn test_config_empty_networks_errors() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks: []
+clat_v6_prefix: "2001:db8::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_parse_ipv4_networks() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+  - "10.0.0.0/8"
+clat_v6_prefix: "2001:db8::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let networks = config.parse_ipv4_networks().unwrap();
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0], (Ipv4Addr::new(192, 168, 1, 0), 24));
+        assert_eq!(networks[1], (Ipv4Addr::new(10, 0, 0, 0), 8));
+    }
+
+    #[test]
+    fn test_config_plat_prefix() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+clat_v6_prefix: "2001:db8::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            config.plat_prefix(),
+            "64:ff9b::".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_config_explicit_prefix_takes_priority() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+clat_v6_prefix: "2001:db8:aaaa::/96"
+dhcpv6_pd_prefix: "2001:db8:bbbb::/48"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let prefix = config.clat_prefix().unwrap();
+        // Explicit clat_v6_prefix should take priority over dhcpv6_pd_prefix
+        assert_eq!(prefix, "2001:db8:aaaa::".parse::<Ipv6Addr>().unwrap());
+    }
 }
