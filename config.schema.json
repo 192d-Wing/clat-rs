@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "clat-rs configuration",
+  "description": "Configuration schema for the clat-rs 464XLAT CLAT daemon (RFC 6877)",
+  "type": "object",
+  "required": [
+    "clat_ipv4_addr",
+    "clat_ipv4_network",
+    "clat_v6_prefix",
+    "plat_v6_prefix",
+    "uplink_interface"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "clat_ipv4_addr": {
+      "type": "string",
+      "description": "IPv4 address assigned to the CLAT TUN interface (gateway for LAN clients)",
+      "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$",
+      "examples": ["192.168.1.1"]
+    },
+    "clat_ipv4_network": {
+      "type": "string",
+      "description": "IPv4 subnet served by the CLAT in CIDR notation",
+      "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)/(3[0-2]|[12]?\\d)$",
+      "examples": ["192.168.1.0/24"]
+    },
+    "clat_v6_prefix": {
+      "type": "string",
+      "description": "/96 IPv6 prefix for CLAT-side address embedding (source addresses per RFC 6052)",
+      "pattern": "/96$",
+      "examples": ["2001:db8:aaaa::/96"]
+    },
+    "plat_v6_prefix": {
+      "type": "string",
+      "description": "/96 IPv6 prefix for PLAT-side address embedding (destination addresses). Use 64:ff9b::/96 for the well-known NAT64 prefix.",
+      "pattern": "/96$",
+      "examples": ["64:ff9b::/96"]
+    },
+    "uplink_interface": {
+      "type": "string",
+      "description": "Host network interface used for IPv6 uplink",
+      "minLength": 1,
+      "examples": ["eth0", "ens192"]
+    },
+    "mtu": {
+      "type": "integer",
+      "description": "TUN interface MTU. Should be <=1440 to avoid fragmentation with IPv6 overhead (20 bytes larger header).",
+      "default": 1400,
+      "minimum": 1280,
+      "maximum": 9000
+    }
+  }
+}

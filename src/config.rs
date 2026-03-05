@@ -32,7 +32,7 @@ fn default_mtu() -> u16 {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents: String = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        let config: Config = serde_yaml_ng::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }

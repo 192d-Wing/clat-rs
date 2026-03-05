@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=config.schema.json
+
+# CLAT daemon configuration
+
+# IPv4 address assigned to the CLAT TUN interface (gateway for LAN clients)
+clat_ipv4_addr: "192.168.1.1"
+
+# IPv4 subnet served by the CLAT (LAN side)
+clat_ipv4_network: "192.168.1.0/24"
+
+# /96 IPv6 prefix for CLAT-side address embedding (source addresses)
+# Must be a /96 from your delegated IPv6 prefix (e.g., via DHCPv6-PD)
+clat_v6_prefix: "2001:db8:aaaa::/96"
+
+# /96 IPv6 prefix for PLAT-side address embedding (destination addresses)
+# This is the NAT64 well-known prefix or the PLAT operator's prefix
+plat_v6_prefix: "64:ff9b::/96"
+
+# Host network interface used for IPv6 uplink
+uplink_interface: "eth0"
+
+# TUN interface MTU (should be <=1440 to avoid fragmentation with IPv6 overhead)
+mtu: 1400

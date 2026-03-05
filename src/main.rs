@@ -16,7 +16,7 @@ use crate::config::Config;
 #[command(name = "clat-rs", about = "464XLAT CLAT daemon (RFC 6877)")]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "/etc/clat-rs/config.toml")]
+    #[arg(short, long, default_value = "/etc/clat-rs/config.yml")]
     config: PathBuf,
 }
 
