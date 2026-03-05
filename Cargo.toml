@@ -10,6 +10,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 env_logger = "0.11.9"
 etherparse = "0.19.0"
 log = "0.4.29"
+prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
 tokio = { version = "1.50.0", features = [
@@ -18,5 +19,11 @@ tokio = { version = "1.50.0", features = [
     "io-util",
     "net",
     "signal",
+    "sync",
 ] }
+tonic = "0.14.5"
+tonic-prost = "0.14.5"
 tun = { version = "0.8.5", features = ["async", "tokio"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"

@@ -1,10 +1,11 @@
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
+use crate::state::SharedState;
 use crate::translate;
 use crate::tun_device;
 
@@ -12,9 +13,10 @@ const TUN_NAME: &str = "clat0";
 const BUF_SIZE: usize = 65536;
 
 /// Run the main CLAT packet translation loop.
-pub async fn run(config: &Config) -> anyhow::Result<()> {
+///
+/// If no CLAT prefix is available at startup, waits for one to be set via gRPC.
+pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
     let networks: Vec<(Ipv4Addr, u8)> = config.parse_ipv4_networks()?;
-    let clat_prefix: Ipv6Addr = config.clat_prefix()?;
     let plat_prefix: Ipv6Addr = config.plat_prefix();
 
     // Create TUN device using the first network for the interface address
@@ -32,20 +34,47 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         log::info!("additional CLAT network: {net}/{prefix}");
     }
 
-    // Bind a raw IPv6 socket for sending/receiving translated packets.
-    // We use a UDP socket bound to [::]:0 as a placeholder — in production
-    // this would be a raw socket (IPPROTO_RAW) for IPv6.
-    // For now, we use a raw socket via std and wrap it.
     let send_sock = create_raw_ipv6_send_socket()?;
-    let recv_sock = create_raw_ipv6_recv_socket(clat_prefix).await?;
+    let recv_sock = create_raw_ipv6_recv_socket().await?;
 
-    log::info!("CLAT packet loop started on {TUN_NAME}");
+    let mut prefix_rx = state.subscribe_prefix();
 
-    let mut tun_buf: [u8; 65536] = [0u8; BUF_SIZE];
-    let mut raw_buf: [u8; 65536] = [0u8; BUF_SIZE];
+    // Wait for initial prefix if not set
+    if state.current_prefix().is_none() {
+        log::info!("no CLAT prefix configured — waiting for gRPC SetPrefix...");
+        loop {
+            if prefix_rx.changed().await.is_err() {
+                anyhow::bail!("prefix channel closed before a prefix was set");
+            }
+            if prefix_rx.borrow().is_some() {
+                break;
+            }
+        }
+    }
+
+    let mut clat_prefix = state.current_prefix().unwrap();
+    log::info!("CLAT packet loop started on {TUN_NAME} with prefix {clat_prefix}");
+    state.set_translating(true);
+
+    let mut tun_buf = [0u8; BUF_SIZE];
+    let mut raw_buf = [0u8; BUF_SIZE];
 
     loop {
         tokio::select! {
+            // Watch for prefix updates (hot-swap)
+            result = prefix_rx.changed() => {
+                if result.is_err() {
+                    log::warn!("prefix watch channel closed");
+                    break;
+                }
+                if let Some(new_prefix) = *prefix_rx.borrow_and_update()
+                    && new_prefix != clat_prefix
+                {
+                    log::info!("hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
+                    clat_prefix = new_prefix;
+                }
+            }
+
             // Read IPv4 packet from TUN -> translate to IPv6 -> send out
             result = tun_dev.read(&mut tun_buf) => {
                 let n = result?;
@@ -84,6 +113,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         }
     }
 
+    state.set_translating(false);
     Ok(())
 }
 
@@ -100,7 +130,7 @@ fn create_raw_ipv6_send_socket() -> anyhow::Result<std::net::UdpSocket> {
 /// Create a raw IPv6 socket for receiving packets destined to our CLAT prefix.
 /// In production, this would use a BPF/packet filter to capture only packets
 /// matching the CLAT prefix on the uplink interface.
-async fn create_raw_ipv6_recv_socket(_clat_prefix: Ipv6Addr) -> anyhow::Result<UdpSocket> {
+async fn create_raw_ipv6_recv_socket() -> anyhow::Result<UdpSocket> {
     // Development placeholder — bind to a high port.
     // In production, this would be a raw socket with a BPF filter
     // or we'd read from a second TUN/TAP device on the IPv6 side.
@@ -118,9 +148,9 @@ async fn send_ipv6_packet(sock: &std::net::UdpSocket, packet: &[u8]) -> anyhow::
     }
 
     // Extract destination IPv6 from the packet header
-    let mut dst_bytes: [u8; 16] = [0u8; 16];
+    let mut dst_bytes = [0u8; 16];
     dst_bytes.copy_from_slice(&packet[24..40]);
-    let dst: Ipv6Addr = Ipv6Addr::from(dst_bytes);
+    let dst = Ipv6Addr::from(dst_bytes);
 
     // For raw sockets this would be sendto() with the raw packet.
     // With UDP placeholder, we send to the destination.

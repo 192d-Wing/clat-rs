@@ -43,8 +43,8 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        // Ensure we can resolve a CLAT prefix
-        self.clat_prefix()?;
+        // Validate CLAT prefix if provided (it can also be set later via gRPC)
+        let _ = self.clat_prefix();
         parse_v6_prefix_96(&self.plat_v6_prefix)?;
         if self.clat_ipv4_networks.is_empty() {
             anyhow::bail!("clat_ipv4_networks must contain at least one subnet");
@@ -104,7 +104,7 @@ fn parse_v6_prefix_96(prefix_str: &str) -> anyhow::Result<Ipv6Addr> {
 /// The PD prefix must be <= /96. The derived /96 uses the same base address
 /// with all bits beyond the PD prefix length zeroed (which they already are
 /// in a properly formatted prefix).
-fn derive_first_96_from_pd(pd_str: &str) -> anyhow::Result<Ipv6Addr> {
+pub fn derive_first_96_from_pd(pd_str: &str) -> anyhow::Result<Ipv6Addr> {
     let parts: Vec<&str> = pd_str.split('/').collect();
     if parts.len() != 2 {
         anyhow::bail!("invalid DHCPv6-PD prefix format: {pd_str}");

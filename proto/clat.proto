@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package clat;
+
+service ClatControl {
+  // Update the DHCPv6-PD prefix. The CLAT /96 prefix is derived automatically.
+  rpc SetPrefix(SetPrefixRequest) returns (SetPrefixResponse);
+
+  // Query current daemon status.
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+}
+
+message SetPrefixRequest {
+  // DHCPv6 Prefix Delegation prefix in CIDR notation (e.g., "2001:db8:aa00::/48").
+  string dhcpv6_pd_prefix = 1;
+}
+
+message SetPrefixResponse {
+  // The /96 prefix derived from the PD and now active for CLAT translation.
+  string derived_clat_prefix = 1;
+}
+
+message GetStatusRequest {}
+
+message StatusResponse {
+  // Active CLAT /96 prefix, empty if not yet set.
+  string clat_prefix = 1;
+
+  // PLAT /96 prefix from config.
+  string plat_prefix = 2;
+
+  // Uplink interface name.
+  string uplink_interface = 3;
+
+  // Whether the packet loop is actively translating.
+  bool translating = 4;
+}
