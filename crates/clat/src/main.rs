@@ -1,12 +1,8 @@
-mod addr;
-mod checksum;
 mod config;
 mod ctl;
 mod grpc;
-mod icmp;
 mod packet_loop;
 mod state;
-mod translate;
 mod tun_device;
 
 use std::net::SocketAddr;

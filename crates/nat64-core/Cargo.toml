@@ -1,0 +1,6 @@
+[package]
+name = "nat64-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Stateless NAT64/NAT46 translation core (RFC 6052, 6145)"

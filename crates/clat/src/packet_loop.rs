@@ -6,7 +6,6 @@ use tokio::net::UdpSocket;
 
 use crate::config::Config;
 use crate::state::SharedState;
-use crate::translate;
 use crate::tun_device;
 
 const TUN_NAME: &str = "clat0";
@@ -83,7 +82,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
                 let ipv4_packet = &tun_buf[..n];
 
-                if let Some(ipv6_packet) = translate::ipv4_to_ipv6(ipv4_packet, clat_prefix, plat_prefix)
+                if let Some(ipv6_packet) = nat64_core::translate::ipv4_to_ipv6(ipv4_packet, clat_prefix, plat_prefix)
                     && let Err(e) = send_ipv6_packet(&send_sock, &ipv6_packet).await
                 {
                     log::warn!("failed to send IPv6 packet: {e}");
@@ -98,7 +97,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
                 let ipv6_packet = &raw_buf[..n];
 
-                if let Some(ipv4_packet) = translate::ipv6_to_ipv4(ipv6_packet, clat_prefix, plat_prefix)
+                if let Some(ipv4_packet) = nat64_core::translate::ipv6_to_ipv4(ipv6_packet, clat_prefix, plat_prefix)
                     && let Err(e) = tun_dev.write_all(&ipv4_packet).await
                 {
                     log::warn!("failed to write IPv4 packet to TUN: {e}");

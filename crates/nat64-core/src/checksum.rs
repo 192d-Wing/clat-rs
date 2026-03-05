@@ -159,13 +159,6 @@ mod tests {
         // Odd-length data exercises the trailing byte branch
         let data = [0x01, 0x02, 0x03];
         let cksum = internet_checksum(&data);
-        // Verify: checksum of data + checksum should be 0
-        let mut buf = data.to_vec();
-        buf.push(0); // pad to even
-        let _check_bytes = cksum.to_be_bytes();
-        // Append checksum
-        let mut verify = data.to_vec();
-        verify.extend_from_slice(&[0x00]); // pad
         // Just verify it's non-zero and deterministic
         assert_eq!(cksum, internet_checksum(&data));
     }

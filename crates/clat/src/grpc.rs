@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::config::derive_first_96_from_pd;
 use crate::state::SharedState;
 
 pub mod pb {
@@ -31,7 +30,7 @@ impl ClatControl for ClatControlService {
         let pd_prefix = &request.get_ref().dhcpv6_pd_prefix;
         log::info!("gRPC SetPrefix called with: {pd_prefix}");
 
-        let derived = derive_first_96_from_pd(pd_prefix)
+        let derived = nat64_core::prefix::derive_first_96_from_pd(pd_prefix)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         self.state.set_prefix(derived);
