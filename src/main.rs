@@ -29,10 +29,11 @@ async fn main() -> anyhow::Result<()> {
     log::info!("loading config from {}", cli.config.display());
     let config = Config::load(&cli.config)?;
 
+    let clat_prefix = config.clat_prefix()?;
     log::info!(
         "CLAT: {} -> {} (PLAT prefix: {})",
         config.clat_ipv4_addr,
-        config.clat_v6_prefix,
+        clat_prefix,
         config.plat_v6_prefix,
     );
 

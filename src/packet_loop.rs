@@ -14,7 +14,7 @@ const BUF_SIZE: usize = 65536;
 /// Run the main CLAT packet translation loop.
 pub async fn run(config: &Config) -> anyhow::Result<()> {
     let networks: Vec<(Ipv4Addr, u8)> = config.parse_ipv4_networks()?;
-    let clat_prefix: Ipv6Addr = config.clat_prefix();
+    let clat_prefix: Ipv6Addr = config.clat_prefix()?;
     let plat_prefix: Ipv6Addr = config.plat_prefix();
 
     // Create TUN device using the first network for the interface address

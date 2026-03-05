@@ -6,9 +6,12 @@
   "required": [
     "clat_ipv4_addr",
     "clat_ipv4_networks",
-    "clat_v6_prefix",
     "plat_v6_prefix",
     "uplink_interface"
+  ],
+  "anyOf": [
+    { "required": ["clat_v6_prefix"] },
+    { "required": ["dhcpv6_pd_prefix"] }
   ],
   "additionalProperties": false,
   "properties": {
@@ -30,9 +33,15 @@
     },
     "clat_v6_prefix": {
       "type": "string",
-      "description": "/96 IPv6 prefix for CLAT-side address embedding (source addresses per RFC 6052)",
+      "description": "Explicit /96 IPv6 prefix for CLAT-side address embedding (source addresses per RFC 6052). Optional if dhcpv6_pd_prefix is set.",
       "pattern": "/96$",
       "examples": ["2001:db8:aaaa::/96"]
+    },
+    "dhcpv6_pd_prefix": {
+      "type": "string",
+      "description": "DHCPv6 Prefix Delegation prefix (e.g., /48 or /56). The first /96 subnet is derived automatically for CLAT translation. Optional if clat_v6_prefix is set.",
+      "pattern": "^[0-9a-fA-F:]+/\\d{1,3}$",
+      "examples": ["2001:db8:aaaa::/48", "2001:db8:aa00::/56"]
     },
     "plat_v6_prefix": {
       "type": "string",

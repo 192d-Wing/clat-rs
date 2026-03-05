@@ -9,9 +9,12 @@ clat_ipv4_addr: "192.168.1.1"
 clat_ipv4_networks:
   - "192.168.1.0/24"
 
-# /96 IPv6 prefix for CLAT-side address embedding (source addresses)
-# Must be a /96 from your delegated IPv6 prefix (e.g., via DHCPv6-PD)
-clat_v6_prefix: "2001:db8:aaaa::/96"
+# Option A: Explicit /96 prefix for CLAT-side address embedding (source addresses)
+# clat_v6_prefix: "2001:db8:aaaa::/96"
+
+# Option B: DHCPv6 Prefix Delegation — the first /96 is derived automatically
+# Only one of clat_v6_prefix or dhcpv6_pd_prefix is required
+dhcpv6_pd_prefix: "2001:db8:aaaa::/48"
 
 # /96 IPv6 prefix for PLAT-side address embedding (destination addresses)
 # This is the NAT64 well-known prefix or the PLAT operator's prefix
