@@ -1,0 +1,20 @@
+[Unit]
+Description=CLAT daemon (464XLAT RFC 6877)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker run --rm --name clat-rs \
+    --net=host \
+    --cap-add=NET_ADMIN \
+    -v /etc/clat-rs:/etc/clat-rs:ro \
+    clat-rs \
+    --config /etc/clat-rs/config.yml \
+    --grpc-addr [::1]:50051
+ExecStop=/usr/bin/docker stop clat-rs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

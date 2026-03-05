@@ -1,0 +1,16 @@
+[Unit]
+Description=DHCPv6-PD client for CLAT (odhcp6c)
+After=network-online.target
+Wants=network-online.target
+Before=clat-rs.service
+
+[Service]
+Type=simple
+# Request a /48 prefix delegation on the WAN interface
+# Adjust -P <prefix-length> and interface name as needed
+ExecStart=/usr/sbin/odhcp6c -P 48 -s /etc/odhcp6c/hook.d/clat-rs.sh %i
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
