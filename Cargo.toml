@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/nat64-core", "crates/clat", "crates/plat"]
+exclude = ["crates/clat-xdp-ebpf"]
 
 [workspace.package]
 edition = "2024"

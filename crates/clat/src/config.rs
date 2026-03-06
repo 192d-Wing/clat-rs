@@ -3,7 +3,65 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+mod xdp_config {
+    use serde::Deserialize;
+
+    /// XDP-specific configuration (only used with `--features xdp`).
+    #[derive(Debug, Deserialize, Clone)]
+    pub struct XdpConfig {
+        /// Path to the compiled XDP eBPF object file.
+        pub xdp_program: std::path::PathBuf,
+
+        /// NIC queue to bind the AF_XDP socket to (default: 0).
+        pub queue_id: Option<u32>,
+
+        /// Number of UMEM frames (default: 4096).
+        pub umem_frames: Option<u32>,
+
+        /// UMEM frame size in bytes (default: 4096, must be 2048 or 4096).
+        pub frame_size: Option<u32>,
+
+        /// Use zero-copy mode (requires i40e/ixgbe driver support).
+        #[serde(default)]
+        pub zero_copy: bool,
+
+        /// Use busy-poll instead of sleep when idle (dedicates a CPU core).
+        #[serde(default)]
+        pub busy_poll: bool,
+
+        /// Gateway MAC address for TX ethernet headers (e.g., "aa:bb:cc:dd:ee:ff").
+        pub gateway_mac: Option<String>,
+    }
+
+    impl XdpConfig {
+        pub fn gateway_mac(&self) -> anyhow::Result<[u8; 6]> {
+            if let Some(ref mac_str) = self.gateway_mac {
+                return parse_mac(mac_str);
+            }
+            anyhow::bail!(
+                "gateway_mac must be set in xdp config (auto-resolve not yet implemented)"
+            )
+        }
+    }
+
+    fn parse_mac(s: &str) -> anyhow::Result<[u8; 6]> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            anyhow::bail!("invalid MAC address: {s}");
+        }
+        let mut mac = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            mac[i] = u8::from_str_radix(part, 16)?;
+        }
+        Ok(mac)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+pub use xdp_config::XdpConfig;
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// IPv4 address for the CLAT TUN interface
     pub clat_ipv4_addr: Ipv4Addr,
@@ -28,6 +86,10 @@ pub struct Config {
     /// TUN MTU (default 1400)
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+
+    /// XDP acceleration config (optional, requires `--features xdp`)
+    #[cfg(all(target_os = "linux", feature = "xdp"))]
+    pub xdp: Option<XdpConfig>,
 }
 
 fn default_mtu() -> u16 {

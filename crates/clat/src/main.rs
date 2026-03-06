@@ -4,6 +4,8 @@ mod grpc;
 mod packet_loop;
 mod state;
 mod tun_device;
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+mod xdp;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -109,6 +111,18 @@ async fn main() -> anyhow::Result<()> {
             log::error!("gRPC server error: {e}");
         }
     });
+
+    // Use XDP packet loop when the feature is enabled and xdp config is present
+    #[cfg(all(target_os = "linux", feature = "xdp"))]
+    if config.xdp.is_some() {
+        log::info!("XDP acceleration enabled — using AF_XDP packet path");
+        let xdp_config = config.clone();
+        let xdp_state = Arc::clone(&state);
+        let handle = std::thread::spawn(move || xdp::run(&xdp_config, xdp_state));
+        return handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("XDP thread panicked"))?;
+    }
 
     packet_loop::run(&config, state).await
 }
