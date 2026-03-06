@@ -159,6 +159,16 @@ fn translate_v6_to_v4(
     let src_v6 = Ipv6Addr::from(src_bytes);
 
     let next_header = ipv6_packet[6];
+
+    // Check for ICMPv6 error messages — these need special handling
+    // because the session lookup uses the embedded inner packet, not the outer.
+    if next_header == 58 {
+        let payload = &ipv6_packet[IPV6_HDR_LEN..];
+        if !payload.is_empty() && is_icmpv6_error(payload[0]) {
+            return translate_icmpv6_error_to_v4(ipv6_packet, payload, nat64_prefix, state);
+        }
+    }
+
     let (src_port, dst_port) = extract_ports(next_header, &ipv6_packet[IPV6_HDR_LEN..])?;
 
     let key = SessionKey {
@@ -331,6 +341,12 @@ fn translate_v4_to_v6(
 
     let payload = &ipv4_packet[ihl..total_len];
 
+    // Check for ICMPv4 error messages — these need special handling
+    // because the session lookup uses the embedded inner packet, not the outer.
+    if protocol == 1 && !payload.is_empty() && is_icmpv4_error(payload[0]) {
+        return translate_icmpv4_error_to_v6(ipv4_packet, payload, nat64_prefix, state);
+    }
+
     // Extract destination port for reverse lookup
     let (_src_port, dst_port) = extract_ports(protocol, payload)?;
 
@@ -467,6 +483,356 @@ fn translate_v4_to_v6(
             pkt.extend_from_slice(payload);
         }
     }
+
+    state.increment_translations();
+    Some(pkt)
+}
+
+/// Check if an ICMPv6 type is an error message (carries an embedded packet).
+fn is_icmpv6_error(icmp_type: u8) -> bool {
+    matches!(icmp_type, 1..=4) // Dest Unreachable, Packet Too Big, Time Exceeded, Parameter Problem
+}
+
+/// Check if an ICMPv4 type is an error message (carries an embedded packet).
+fn is_icmpv4_error(icmp_type: u8) -> bool {
+    matches!(icmp_type, 3 | 11 | 12) // Dest Unreachable, Time Exceeded, Parameter Problem
+}
+
+/// Translate an ICMPv6 error message to ICMPv4.
+///
+/// ICMPv6 errors embed the offending IPv6 packet starting at byte 8.
+/// We look up the session for the inner flow and translate both the
+/// outer ICMP header and the embedded inner packet.
+fn translate_icmpv6_error_to_v4(
+    ipv6_packet: &[u8],
+    payload: &[u8],
+    nat64_prefix: Ipv6Addr,
+    state: &SharedState,
+) -> Option<Vec<u8>> {
+    // ICMPv6 error: [type(1) code(1) checksum(2) unused/mtu(4) embedded_ipv6_packet...]
+    if payload.len() < 8 + IPV6_HDR_LEN {
+        return None;
+    }
+
+    let mapping = nat64_core::icmp::icmpv6_to_icmpv4(payload[0], payload[1])?;
+    let inner_v6 = &payload[8..];
+
+    // Parse the embedded IPv6 header
+    let mut inner_src_bytes = [0u8; 16];
+    inner_src_bytes.copy_from_slice(&inner_v6[8..24]);
+    let inner_src_v6 = Ipv6Addr::from(inner_src_bytes);
+
+    let mut inner_dst_bytes = [0u8; 16];
+    inner_dst_bytes.copy_from_slice(&inner_v6[24..40]);
+    let inner_dst_v6 = Ipv6Addr::from(inner_dst_bytes);
+
+    let inner_next_header = inner_v6[6];
+    let inner_payload = if inner_v6.len() > IPV6_HDR_LEN {
+        &inner_v6[IPV6_HDR_LEN..]
+    } else {
+        &[]
+    };
+
+    // Extract ports from the inner packet's transport header
+    let (inner_src_port, inner_dst_port) = extract_ports(inner_next_header, inner_payload)?;
+
+    // Look up the session for the inner flow
+    // The inner packet was sent BY our client, so the session key matches
+    let inner_key = SessionKey {
+        src_v6: inner_src_v6,
+        dst_v6: inner_dst_v6,
+        protocol: inner_next_header,
+        src_port: inner_src_port,
+        dst_port: inner_dst_port,
+    };
+
+    let inner_binding = {
+        let mut nat = state.nat.lock().unwrap();
+        let crate::state::NatState { sessions, pool } = &mut *nat;
+        match sessions.lookup_or_create(inner_key, pool) {
+            LookupResult::Existing(b) | LookupResult::Created(b) => b,
+            LookupResult::Exhausted => return None,
+        }
+    };
+
+    // Build the translated inner IPv4 header
+    let inner_dst_v4 = nat64_core::addr::extract_ipv4_from_ipv6(inner_dst_v6);
+    let inner_src_v4 = inner_binding.pool_addr;
+    let inner_ipv4_proto = match inner_next_header {
+        58 => 1,
+        p => p,
+    };
+
+    let inner_payload_len = u16::from_be_bytes([inner_v6[4], inner_v6[5]]) as usize;
+    let inner_payload_actual = inner_payload.len().min(inner_payload_len);
+    // RFC 6145: include as much of the inner packet as possible, at least 8 bytes of transport
+    let inner_total_len = (IPV4_HDR_LEN + inner_payload_actual) as u16;
+
+    let mut inner_v4 = Vec::with_capacity(inner_total_len as usize);
+    inner_v4.push(0x45);
+    inner_v4.push(0x00);
+    inner_v4.extend_from_slice(&inner_total_len.to_be_bytes());
+    inner_v4.extend_from_slice(&[0x00, 0x00]); // id
+    inner_v4.extend_from_slice(&[0x40, 0x00]); // DF
+    inner_v4.push(inner_v6[7]); // hop limit -> TTL
+    inner_v4.push(inner_ipv4_proto);
+    inner_v4.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+    inner_v4.extend_from_slice(&inner_src_v4.octets());
+    inner_v4.extend_from_slice(&inner_dst_v4.octets());
+
+    let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&inner_v4[..IPV4_HDR_LEN]);
+    inner_v4[10] = (hdr_cksum >> 8) as u8;
+    inner_v4[11] = (hdr_cksum & 0xFF) as u8;
+
+    // Rewrite inner transport source port to mapped_port
+    if inner_payload_actual >= 2 {
+        let mut tp = inner_payload[..inner_payload_actual].to_vec();
+        match inner_next_header {
+            6 | 17 if tp.len() >= 2 => {
+                tp[0] = (inner_binding.mapped_port >> 8) as u8;
+                tp[1] = (inner_binding.mapped_port & 0xFF) as u8;
+            }
+            58 if tp.len() >= 6 => {
+                // ICMPv6 echo identifier
+                tp[4] = (inner_binding.mapped_port >> 8) as u8;
+                tp[5] = (inner_binding.mapped_port & 0xFF) as u8;
+            }
+            _ => {}
+        }
+        inner_v4.extend_from_slice(&tp);
+    }
+
+    // Build the outer ICMPv4 error packet
+    // Outer addresses: src = whoever sent the error (embedded in prefix), dst = our pool addr
+    let outer_src_v6 = Ipv6Addr::from({
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&ipv6_packet[8..24]);
+        b
+    });
+    let outer_dst_v4 = inner_src_v4; // error goes back to the original sender (our pool addr)
+    let outer_src_v4 = if nat64_core::addr::matches_prefix_96(outer_src_v6, nat64_prefix) {
+        nat64_core::addr::extract_ipv4_from_ipv6(outer_src_v6)
+    } else {
+        // Source of error is not in the NAT64 prefix — use 0.0.0.0 as fallback
+        // (this shouldn't normally happen in a well-configured network)
+        Ipv4Addr::new(0, 0, 0, 0)
+    };
+
+    let icmp_payload_len = 8 + inner_v4.len(); // type+code+cksum+unused + inner
+    let outer_total_len = (IPV4_HDR_LEN + icmp_payload_len) as u16;
+    let hop_limit = ipv6_packet[7];
+    let tos = ((ipv6_packet[0] & 0x0F) << 4) | (ipv6_packet[1] >> 4);
+
+    let mut pkt = Vec::with_capacity(outer_total_len as usize);
+    pkt.push(0x45);
+    pkt.push(tos);
+    pkt.extend_from_slice(&outer_total_len.to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00]);
+    pkt.extend_from_slice(&[0x00, 0x00]); // no DF for ICMP errors
+    pkt.push(hop_limit.saturating_sub(1));
+    pkt.push(1); // ICMP
+    pkt.extend_from_slice(&[0x00, 0x00]);
+    pkt.extend_from_slice(&outer_src_v4.octets());
+    pkt.extend_from_slice(&outer_dst_v4.octets());
+
+    let outer_hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&pkt[..IPV4_HDR_LEN]);
+    pkt[10] = (outer_hdr_cksum >> 8) as u8;
+    pkt[11] = (outer_hdr_cksum & 0xFF) as u8;
+
+    // ICMP error header: type, code, checksum(0), unused/mtu(4 bytes from original)
+    let mut icmp_hdr = Vec::with_capacity(icmp_payload_len);
+    icmp_hdr.push(mapping.icmp_type);
+    icmp_hdr.push(mapping.icmp_code);
+    icmp_hdr.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+    // Copy the 4-byte field (unused for most errors, MTU for Packet Too Big)
+    icmp_hdr.extend_from_slice(&payload[4..8]);
+    icmp_hdr.extend_from_slice(&inner_v4);
+
+    // For Packet Too Big -> Frag Needed, adjust the MTU field
+    if payload[0] == nat64_core::icmp::ICMPV6_PACKET_TOO_BIG {
+        let mtu_v6 = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        // Subtract 20 bytes for the IPv6/IPv4 header size difference
+        let mtu_v4 = mtu_v6.saturating_sub(20).min(65535) as u16;
+        // ICMPv4 Frag Needed: bytes 4-5 are unused (0), bytes 6-7 are next-hop MTU
+        icmp_hdr[4] = 0;
+        icmp_hdr[5] = 0;
+        icmp_hdr[6] = (mtu_v4 >> 8) as u8;
+        icmp_hdr[7] = (mtu_v4 & 0xFF) as u8;
+    }
+
+    let cksum = nat64_core::checksum::internet_checksum(&icmp_hdr);
+    icmp_hdr[2] = (cksum >> 8) as u8;
+    icmp_hdr[3] = (cksum & 0xFF) as u8;
+
+    pkt.extend_from_slice(&icmp_hdr);
+
+    state.increment_translations();
+    Some(pkt)
+}
+
+/// Translate an ICMPv4 error message to ICMPv6.
+///
+/// ICMPv4 errors embed the offending IPv4 header + first 8 bytes of payload.
+/// We look up the session for the inner flow and translate both the
+/// outer ICMP header and the embedded inner packet.
+fn translate_icmpv4_error_to_v6(
+    ipv4_packet: &[u8],
+    payload: &[u8],
+    nat64_prefix: Ipv6Addr,
+    state: &SharedState,
+) -> Option<Vec<u8>> {
+    // ICMPv4 error: [type(1) code(1) checksum(2) unused/mtu(4) embedded_ipv4_packet...]
+    if payload.len() < 8 + IPV4_HDR_LEN {
+        return None;
+    }
+
+    let mapping = nat64_core::icmp::icmpv4_to_icmpv6(payload[0], payload[1])?;
+    let inner_v4 = &payload[8..];
+
+    // Parse the embedded IPv4 header
+    let inner_ihl = ((inner_v4[0] & 0x0F) as usize) * 4;
+    if inner_v4.len() < inner_ihl {
+        return None;
+    }
+    let inner_src_v4 = Ipv4Addr::new(inner_v4[12], inner_v4[13], inner_v4[14], inner_v4[15]);
+    // inner_dst_v4 not needed: we get the original destination from fwd_key.dst_v6
+    let inner_protocol = inner_v4[9];
+
+    let inner_tp = if inner_v4.len() > inner_ihl {
+        &inner_v4[inner_ihl..]
+    } else {
+        &[]
+    };
+
+    // Extract ports from inner transport header
+    let (inner_src_port, _inner_dst_port) = extract_ports(inner_protocol, inner_tp)?;
+
+    // Map protocol for session lookup
+    let inner_session_proto = match inner_protocol {
+        1 => 58,
+        p => p,
+    };
+
+    // Reverse lookup: the inner packet was sent BY our PLAT (src=pool, sport=mapped)
+    // so we use the inner source address/port for reverse lookup.
+    let (fwd_key, _binding) = {
+        let mut nat = state.nat.lock().unwrap();
+        nat.sessions
+            .reverse_lookup(inner_src_v4, inner_src_port, inner_session_proto)?
+    };
+
+    // Build the translated inner IPv6 header.
+    // The inner IPv4 packet was the translated forward flow (src=pool, dst=server).
+    // Reconstruct the original pre-NAT IPv6 packet: src=client, dst=64:ff9b::server.
+    let inner_src_v6 = fwd_key.src_v6; // original client
+    let inner_dst_v6 = fwd_key.dst_v6; // 64:ff9b::server
+    let inner_next_header = match inner_protocol {
+        1 => 58,
+        p => p,
+    };
+
+    let inner_tp_len = inner_tp.len();
+    let inner_payload_len = inner_tp_len as u16;
+
+    let mut inner_v6 = Vec::with_capacity(IPV6_HDR_LEN + inner_tp_len);
+    inner_v6.push(0x60);
+    inner_v6.extend_from_slice(&[0x00, 0x00, 0x00]);
+    inner_v6.extend_from_slice(&inner_payload_len.to_be_bytes());
+    inner_v6.push(inner_next_header);
+    inner_v6.push(inner_v4[8]); // TTL -> hop limit
+    inner_v6.extend_from_slice(&inner_src_v6.octets());
+    inner_v6.extend_from_slice(&inner_dst_v6.octets());
+
+    // Rewrite inner transport dest port back to original
+    if inner_tp_len >= 4 {
+        let mut tp = inner_tp.to_vec();
+        match inner_protocol {
+            6 | 17 if tp.len() >= 4 => {
+                // Restore original destination port (client's source port)
+                tp[2] = (fwd_key.src_port >> 8) as u8;
+                tp[3] = (fwd_key.src_port & 0xFF) as u8;
+            }
+            1 if tp.len() >= 6 => {
+                // Restore ICMP identifier
+                tp[4] = (fwd_key.src_port >> 8) as u8;
+                tp[5] = (fwd_key.src_port & 0xFF) as u8;
+            }
+            _ => {}
+        }
+        inner_v6.extend_from_slice(&tp);
+    }
+
+    // Build the outer ICMPv6 error packet
+    let outer_src_v4 = Ipv4Addr::new(
+        ipv4_packet[12],
+        ipv4_packet[13],
+        ipv4_packet[14],
+        ipv4_packet[15],
+    );
+    let outer_src_v6 = nat64_core::addr::embed_ipv4_in_ipv6(nat64_prefix, outer_src_v4);
+    let outer_dst_v6 = fwd_key.src_v6; // error goes back to the original client
+
+    let icmpv6_body_len = 8 + inner_v6.len(); // type+code+cksum+unused + inner
+    let ttl = ipv4_packet[8];
+    let tos = ipv4_packet[1];
+
+    let mut pkt = Vec::with_capacity(IPV6_HDR_LEN + icmpv6_body_len);
+    pkt.push(0x60 | (tos >> 4));
+    pkt.push(tos << 4);
+    pkt.push(0x00);
+    pkt.push(0x00);
+    pkt.extend_from_slice(&(icmpv6_body_len as u16).to_be_bytes());
+    pkt.push(58); // ICMPv6
+    pkt.push(ttl.saturating_sub(1));
+    pkt.extend_from_slice(&outer_src_v6.octets());
+    pkt.extend_from_slice(&outer_dst_v6.octets());
+
+    // ICMPv6 error body
+    let mut icmpv6 = Vec::with_capacity(icmpv6_body_len);
+    icmpv6.push(mapping.icmp_type);
+    icmpv6.push(mapping.icmp_code);
+    icmpv6.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+    // Copy the 4-byte field
+    icmpv6.extend_from_slice(&payload[4..8]);
+    icmpv6.extend_from_slice(&inner_v6);
+
+    // For Frag Needed -> Packet Too Big, adjust MTU
+    if payload[0] == nat64_core::icmp::ICMPV4_DEST_UNREACHABLE
+        && payload[1] == nat64_core::icmp::ICMPV4_DU_FRAG_NEEDED
+    {
+        let mtu_v4 = u16::from_be_bytes([payload[6], payload[7]]);
+        // Add 20 bytes for IPv4→IPv6 header size difference
+        let mtu_v6 = (u32::from(mtu_v4) + 20).min(65535);
+        icmpv6[4] = (mtu_v6 >> 24) as u8;
+        icmpv6[5] = ((mtu_v6 >> 16) & 0xFF) as u8;
+        icmpv6[6] = ((mtu_v6 >> 8) & 0xFF) as u8;
+        icmpv6[7] = (mtu_v6 & 0xFF) as u8;
+    }
+
+    // ICMPv6 checksum with pseudo-header
+    let pseudo = nat64_core::checksum::ipv6_pseudo_header_sum(
+        outer_src_v6,
+        outer_dst_v6,
+        58,
+        icmpv6.len() as u32,
+    );
+    let mut sum = pseudo;
+    let mut i = 0;
+    while i + 1 < icmpv6.len() {
+        sum += u32::from(u16::from_be_bytes([icmpv6[i], icmpv6[i + 1]]));
+        i += 2;
+    }
+    if i < icmpv6.len() {
+        sum += u32::from(icmpv6[i]) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    icmpv6[2] = (cksum >> 8) as u8;
+    icmpv6[3] = (cksum & 0xFF) as u8;
+
+    pkt.extend_from_slice(&icmpv6);
 
     state.increment_translations();
     Some(pkt)
@@ -1115,5 +1481,358 @@ mod tests {
         let mut dst_bytes = [0u8; 16];
         dst_bytes.copy_from_slice(&v6_reply[24..40]);
         assert_eq!(Ipv6Addr::from(dst_bytes), client_v6);
+    }
+
+    /// Build an ICMPv6 Destination Unreachable error wrapping an inner IPv6/TCP packet.
+    fn build_icmpv6_error(
+        src_v6: Ipv6Addr,
+        dst_v6: Ipv6Addr,
+        icmp_type: u8,
+        icmp_code: u8,
+        extra_field: [u8; 4],
+        inner_pkt: &[u8],
+    ) -> Vec<u8> {
+        let icmpv6_len = 8 + inner_pkt.len(); // type+code+cksum+field(4) + inner
+        let payload_len = icmpv6_len as u16;
+        let mut pkt = Vec::with_capacity(IPV6_HDR_LEN + icmpv6_len);
+
+        // IPv6 header
+        pkt.push(0x60);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.push(58); // ICMPv6
+        pkt.push(64); // hop limit
+        pkt.extend_from_slice(&src_v6.octets());
+        pkt.extend_from_slice(&dst_v6.octets());
+
+        // ICMPv6 body
+        pkt.push(icmp_type);
+        pkt.push(icmp_code);
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&extra_field);
+        pkt.extend_from_slice(inner_pkt);
+
+        // Compute ICMPv6 checksum
+        let icmpv6_data = &pkt[IPV6_HDR_LEN..];
+        let pseudo = nat64_core::checksum::ipv6_pseudo_header_sum(
+            src_v6,
+            dst_v6,
+            58,
+            icmpv6_data.len() as u32,
+        );
+        let mut sum = pseudo;
+        let mut i = 0;
+        while i + 1 < icmpv6_data.len() {
+            sum += u32::from(u16::from_be_bytes([icmpv6_data[i], icmpv6_data[i + 1]]));
+            i += 2;
+        }
+        if i < icmpv6_data.len() {
+            sum += u32::from(icmpv6_data[i]) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let cksum = !(sum as u16);
+        let cksum_offset = IPV6_HDR_LEN + 2;
+        pkt[cksum_offset] = (cksum >> 8) as u8;
+        pkt[cksum_offset + 1] = (cksum & 0xFF) as u8;
+
+        pkt
+    }
+
+    /// Build an ICMPv4 error wrapping an inner IPv4 packet.
+    fn build_icmpv4_error(
+        src_v4: Ipv4Addr,
+        dst_v4: Ipv4Addr,
+        icmp_type: u8,
+        icmp_code: u8,
+        extra_field: [u8; 4],
+        inner_pkt: &[u8],
+    ) -> Vec<u8> {
+        let icmp_len = 8 + inner_pkt.len();
+        let total_len = (IPV4_HDR_LEN + icmp_len) as u16;
+        let mut pkt = Vec::with_capacity(total_len as usize);
+
+        // IPv4 header
+        pkt.push(0x45);
+        pkt.push(0x00);
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        pkt.push(64); // TTL
+        pkt.push(1); // ICMP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&src_v4.octets());
+        pkt.extend_from_slice(&dst_v4.octets());
+
+        let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&pkt[..IPV4_HDR_LEN]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        // ICMP body
+        pkt.push(icmp_type);
+        pkt.push(icmp_code);
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&extra_field);
+        pkt.extend_from_slice(inner_pkt);
+
+        // Compute ICMP checksum
+        let icmp_data = &pkt[IPV4_HDR_LEN..];
+        let cksum = nat64_core::checksum::internet_checksum(icmp_data);
+        pkt[IPV4_HDR_LEN + 2] = (cksum >> 8) as u8;
+        pkt[IPV4_HDR_LEN + 3] = (cksum & 0xFF) as u8;
+
+        pkt
+    }
+
+    #[test]
+    fn test_icmpv6_dest_unreachable_translates_to_v4() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let server_v4 = Ipv4Addr::new(93, 184, 216, 34);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+        let client_v6: Ipv6Addr = "2001:db8::10".parse().unwrap();
+
+        // Scenario: A return IPv6 packet (src=64:ff9b::server, dst=client) was being
+        // forwarded and hit a router that sent an ICMPv6 error TO 64:ff9b::server
+        // (the source of the offending return packet). Since 64:ff9b::/96 is routed
+        // to the PLAT, this error arrives at us.
+        //
+        // The inner embedded packet is the offending return packet:
+        //   src=server_v6 (64:ff9b::server), dst=client_v6
+        let router_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+        let inner_v6_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 80, 44444);
+        let icmpv6_error = build_icmpv6_error(
+            router_v6,
+            server_v6, // dst is in NAT64 prefix, so PLAT receives it
+            1,         // Dest Unreachable
+            0,         // No route to destination
+            [0, 0, 0, 0],
+            &inner_v6_pkt,
+        );
+
+        // Translate the ICMPv6 error to ICMPv4
+        let v4_error = translate_v6_to_v4(&icmpv6_error, prefix, &state).unwrap();
+
+        // Verify outer IPv4 header
+        assert_eq!(v4_error[0] >> 4, 4); // IPv4
+        assert_eq!(v4_error[9], 1); // ICMP
+        assert!(verify_ipv4_checksum(&v4_error));
+
+        // ICMP type should be 3 (Dest Unreachable)
+        let ihl = ((v4_error[0] & 0x0F) as usize) * 4;
+        assert_eq!(v4_error[ihl], 3);
+
+        // Verify ICMP checksum
+        let total_len = u16::from_be_bytes([v4_error[2], v4_error[3]]) as usize;
+        let icmp_data = &v4_error[ihl..total_len];
+        assert_eq!(nat64_core::checksum::internet_checksum(icmp_data), 0);
+
+        // Verify there's an inner IPv4 packet embedded
+        let inner_v4_start = ihl + 8;
+        assert!(v4_error.len() > inner_v4_start + IPV4_HDR_LEN);
+        assert_eq!(v4_error[inner_v4_start] >> 4, 4); // inner is IPv4
+    }
+
+    #[test]
+    fn test_icmpv6_packet_too_big_mtu_adjustment() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let server_v4 = Ipv4Addr::new(8, 8, 8, 8);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+        let client_v6: Ipv6Addr = "2001:db8::20".parse().unwrap();
+
+        // Same scenario: a return packet (src=server_v6, dst=client) triggered
+        // a Packet Too Big. Error is sent to server_v6 (in NAT64 prefix).
+        let router_v6: Ipv6Addr = "2001:db8:aaaa::1".parse().unwrap();
+        let inner_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 443, 55555);
+        let mtu_v6: u32 = 1280;
+        let mtu_field = mtu_v6.to_be_bytes();
+        let icmpv6_ptb = build_icmpv6_error(
+            router_v6, server_v6, // dst in NAT64 prefix
+            2,         // Packet Too Big
+            0, mtu_field, &inner_pkt,
+        );
+
+        let v4_error = translate_v6_to_v4(&icmpv6_ptb, prefix, &state).unwrap();
+
+        // Should be ICMPv4 Dest Unreachable, code 4 (Frag Needed)
+        let ihl = ((v4_error[0] & 0x0F) as usize) * 4;
+        assert_eq!(v4_error[ihl], 3); // Dest Unreachable
+        assert_eq!(v4_error[ihl + 1], 4); // Frag Needed
+
+        // MTU should be adjusted: 1280 - 20 = 1260
+        let mtu_v4 = u16::from_be_bytes([v4_error[ihl + 6], v4_error[ihl + 7]]);
+        assert_eq!(mtu_v4, 1260);
+    }
+
+    #[test]
+    fn test_icmpv4_dest_unreachable_translates_to_v6() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let client_v6: Ipv6Addr = "2001:db8::30".parse().unwrap();
+        let server_v4 = Ipv4Addr::new(203, 0, 113, 1);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+
+        // Establish session via v6->v4 translation
+        let tcp_pkt = build_ipv6_tcp_syn(client_v6, server_v6, 33333, 80);
+        let v4_out = translate_v6_to_v4(&tcp_pkt, prefix, &state).unwrap();
+        let pool_addr = Ipv4Addr::new(v4_out[12], v4_out[13], v4_out[14], v4_out[15]);
+        let mapped_port = u16::from_be_bytes([v4_out[20], v4_out[21]]);
+
+        // Build an ICMPv4 Dest Unreachable (Port Unreachable) from the server,
+        // embedding the translated IPv4 packet (src=pool, dst=server, sport=mapped)
+        let inner_v4_total = IPV4_HDR_LEN + 8; // header + 8 bytes of TCP
+        let mut inner_v4 = Vec::with_capacity(inner_v4_total);
+        inner_v4.push(0x45);
+        inner_v4.push(0x00);
+        inner_v4.extend_from_slice(&(inner_v4_total as u16).to_be_bytes());
+        inner_v4.extend_from_slice(&[0, 0, 0x40, 0x00]);
+        inner_v4.push(63); // TTL
+        inner_v4.push(6); // TCP
+        inner_v4.extend_from_slice(&[0, 0]); // checksum placeholder
+        inner_v4.extend_from_slice(&pool_addr.octets()); // src = pool
+        inner_v4.extend_from_slice(&server_v4.octets()); // dst = server
+
+        let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&inner_v4[..IPV4_HDR_LEN]);
+        inner_v4[10] = (hdr_cksum >> 8) as u8;
+        inner_v4[11] = (hdr_cksum & 0xFF) as u8;
+
+        // TCP: 8 bytes (src_port=mapped, dst_port=80, seq, ...)
+        inner_v4.extend_from_slice(&mapped_port.to_be_bytes());
+        inner_v4.extend_from_slice(&80u16.to_be_bytes());
+        inner_v4.extend_from_slice(&[0, 0, 0, 0]); // seq number
+
+        let icmpv4_error = build_icmpv4_error(
+            server_v4,
+            pool_addr,
+            3, // Dest Unreachable
+            3, // Port Unreachable
+            [0, 0, 0, 0],
+            &inner_v4,
+        );
+
+        let v6_error = translate_v4_to_v6(&icmpv4_error, prefix, &state).unwrap();
+
+        // Verify outer IPv6 header
+        assert_eq!(v6_error[0] >> 4, 6); // IPv6
+        assert_eq!(v6_error[6], 58); // ICMPv6
+
+        // Destination should be the original client
+        let mut dst_bytes = [0u8; 16];
+        dst_bytes.copy_from_slice(&v6_error[24..40]);
+        assert_eq!(Ipv6Addr::from(dst_bytes), client_v6);
+
+        // ICMPv6 type should be 1 (Dest Unreachable)
+        assert_eq!(v6_error[IPV6_HDR_LEN], 1);
+
+        // Verify inner IPv6 packet has restored destination port
+        let inner_v6_start = IPV6_HDR_LEN + 8; // after ICMPv6 header
+        let inner_v6_tcp_start = inner_v6_start + IPV6_HDR_LEN;
+        if v6_error.len() > inner_v6_tcp_start + 4 {
+            let inner_dst_port = u16::from_be_bytes([
+                v6_error[inner_v6_tcp_start + 2],
+                v6_error[inner_v6_tcp_start + 3],
+            ]);
+            assert_eq!(inner_dst_port, 33333); // restored original src_port
+        }
+    }
+
+    #[test]
+    fn test_icmpv4_frag_needed_mtu_adjustment() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let client_v6: Ipv6Addr = "2001:db8::40".parse().unwrap();
+        let server_v4 = Ipv4Addr::new(198, 51, 100, 50);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+
+        // Establish session
+        let tcp_pkt = build_ipv6_tcp_syn(client_v6, server_v6, 22222, 443);
+        let v4_out = translate_v6_to_v4(&tcp_pkt, prefix, &state).unwrap();
+        let pool_addr = Ipv4Addr::new(v4_out[12], v4_out[13], v4_out[14], v4_out[15]);
+        let mapped_port = u16::from_be_bytes([v4_out[20], v4_out[21]]);
+
+        // Build inner IPv4 packet (the offending packet)
+        let inner_v4_total = IPV4_HDR_LEN + 8;
+        let mut inner_v4 = Vec::with_capacity(inner_v4_total);
+        inner_v4.push(0x45);
+        inner_v4.push(0x00);
+        inner_v4.extend_from_slice(&(inner_v4_total as u16).to_be_bytes());
+        inner_v4.extend_from_slice(&[0, 0, 0x40, 0x00]);
+        inner_v4.push(63);
+        inner_v4.push(6); // TCP
+        inner_v4.extend_from_slice(&[0, 0]);
+        inner_v4.extend_from_slice(&pool_addr.octets());
+        inner_v4.extend_from_slice(&server_v4.octets());
+
+        let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&inner_v4[..IPV4_HDR_LEN]);
+        inner_v4[10] = (hdr_cksum >> 8) as u8;
+        inner_v4[11] = (hdr_cksum & 0xFF) as u8;
+
+        inner_v4.extend_from_slice(&mapped_port.to_be_bytes());
+        inner_v4.extend_from_slice(&443u16.to_be_bytes());
+        inner_v4.extend_from_slice(&[0, 0, 0, 0]);
+
+        // ICMPv4 Frag Needed: type=3, code=4, bytes 6-7 = next-hop MTU
+        let mtu_v4: u16 = 1400;
+        let extra = [0, 0, (mtu_v4 >> 8) as u8, (mtu_v4 & 0xFF) as u8];
+        let icmpv4_error = build_icmpv4_error(
+            server_v4, pool_addr, 3, // Dest Unreachable
+            4, // Frag Needed
+            extra, &inner_v4,
+        );
+
+        let v6_error = translate_v4_to_v6(&icmpv4_error, prefix, &state).unwrap();
+
+        // Should be ICMPv6 Packet Too Big (type=2)
+        assert_eq!(v6_error[IPV6_HDR_LEN], 2);
+
+        // MTU should be adjusted: 1400 + 20 = 1420
+        let mtu_v6 = u32::from_be_bytes([
+            v6_error[IPV6_HDR_LEN + 4],
+            v6_error[IPV6_HDR_LEN + 5],
+            v6_error[IPV6_HDR_LEN + 6],
+            v6_error[IPV6_HDR_LEN + 7],
+        ]);
+        assert_eq!(mtu_v6, 1420);
+    }
+
+    #[test]
+    fn test_icmpv6_error_creates_session_for_inner_flow() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let server_v4 = Ipv4Addr::new(10, 0, 0, 1);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+        let client_v6: Ipv6Addr = "2001:db8::99".parse().unwrap();
+
+        // No session pre-established. The ICMP error handler uses lookup_or_create
+        // so it will create a session for the inner flow on-the-fly.
+        let router_v6: Ipv6Addr = "2001:db8:bbbb::1".parse().unwrap();
+        let inner_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 80, 11111);
+        let icmpv6_error = build_icmpv6_error(
+            router_v6,
+            server_v6, // dst in NAT64 prefix
+            1,
+            0,
+            [0, 0, 0, 0],
+            &inner_pkt,
+        );
+
+        let result = translate_v6_to_v4(&icmpv6_error, prefix, &state);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_icmpv6_error_runt_inner_dropped() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let router_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let client_v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+
+        // Build an ICMPv6 error with a too-short inner packet (< 40 bytes IPv6 header)
+        let short_inner = [0x60, 0x00, 0x00, 0x00]; // only 4 bytes
+        let icmpv6_error =
+            build_icmpv6_error(router_v6, client_v6, 1, 0, [0, 0, 0, 0], &short_inner);
+
+        assert!(translate_v6_to_v4(&icmpv6_error, prefix, &state).is_none());
     }
 }
