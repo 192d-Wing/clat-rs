@@ -74,7 +74,8 @@ fn prefix_to_netmask(prefix_len: u8) -> Ipv4Addr {
     if prefix_len == 0 {
         return Ipv4Addr::new(0, 0, 0, 0);
     }
-    let mask: u32 = !0u32 << (32 - prefix_len);
+    let clamped = prefix_len.min(32);
+    let mask: u32 = !0u32 << (32 - clamped);
     Ipv4Addr::from(mask)
 }
 

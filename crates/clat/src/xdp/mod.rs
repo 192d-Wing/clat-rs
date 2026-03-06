@@ -264,7 +264,8 @@ fn prefix_to_netmask(prefix_len: u8) -> std::net::Ipv4Addr {
     if prefix_len == 0 {
         return std::net::Ipv4Addr::new(0, 0, 0, 0);
     }
-    let mask: u32 = !0u32 << (32 - prefix_len);
+    let clamped = prefix_len.min(32);
+    let mask: u32 = !0u32 << (32 - clamped);
     std::net::Ipv4Addr::from(mask)
 }
 
