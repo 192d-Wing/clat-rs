@@ -12,14 +12,16 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMPV6: u8 = 58;
 
-/// Translate an IPv4 packet to IPv6.
+/// Translate an IPv4 packet to IPv6, writing into the provided buffer.
 ///
-/// Returns the translated IPv6 packet, or `None` if the packet should be dropped.
-pub fn ipv4_to_ipv6(
+/// Returns the number of bytes written, or `None` if the packet should be dropped.
+/// The buffer must be large enough for the output (IPv6 header + payload).
+pub fn ipv4_to_ipv6_buf(
     packet: &[u8],
     clat_prefix: Ipv6Addr,
     plat_prefix: Ipv6Addr,
-) -> Option<Vec<u8>> {
+    out: &mut [u8],
+) -> Option<usize> {
     if packet.len() < IPV4_HEADER_MIN_LEN {
         return None;
     }
@@ -35,8 +37,6 @@ pub fn ipv4_to_ipv6(
     }
 
     // Validate IPv4 header checksum to prevent checksum laundering (M-1).
-    // TUN devices deliver packets before kernel checksum verification,
-    // so corrupted packets could otherwise receive fresh valid checksums.
     if checksum::internet_checksum(&packet[..ihl]) != 0 {
         return None;
     }
@@ -50,7 +50,6 @@ pub fn ipv4_to_ipv6(
     let protocol = packet[9];
     let ttl = packet[8];
 
-    // Drop packets that would expire after translation (TTL decrement)
     if ttl <= 1 {
         return None;
     }
@@ -60,54 +59,81 @@ pub fn ipv4_to_ipv6(
     let payload = &packet[ihl..total_len];
     let payload_len = payload.len();
 
-    // Map protocol: ICMP -> ICMPv6
     let next_header = match protocol {
         PROTO_ICMP => PROTO_ICMPV6,
         p => p,
     };
 
-    // Build IPv6 addresses per RFC 6052
     let src_v6 = addr::embed_ipv4_in_ipv6(clat_prefix, src_ip);
     let dst_v6 = addr::embed_ipv4_in_ipv6(plat_prefix, dst_ip);
 
-    // Build IPv6 header (40 bytes)
-    let mut v6_packet = Vec::with_capacity(IPV6_HEADER_LEN + payload_len);
-
-    // Version (4) + Traffic Class high 4 bits
-    v6_packet.push(0x60 | (tos >> 4));
-    // Traffic Class low 4 bits + Flow Label (20 bits, set to 0)
-    v6_packet.push(tos << 4);
-    v6_packet.push(0x00);
-    v6_packet.push(0x00);
-
-    // Payload Length
-    if payload_len > u16::MAX as usize {
+    let out_len = IPV6_HEADER_LEN + payload_len;
+    if payload_len > u16::MAX as usize || out.len() < out_len {
         return None;
     }
-    v6_packet.extend_from_slice(&(payload_len as u16).to_be_bytes());
 
-    // Next Header
-    v6_packet.push(next_header);
+    // Build IPv6 header as a fixed array, single copy
+    let pl_bytes = (payload_len as u16).to_be_bytes();
+    let src_oct = src_v6.octets();
+    let dst_oct = dst_v6.octets();
+    let hdr: [u8; IPV6_HEADER_LEN] = [
+        0x60 | (tos >> 4),
+        tos << 4,
+        0x00,
+        0x00,
+        pl_bytes[0],
+        pl_bytes[1],
+        next_header,
+        ttl.saturating_sub(1),
+        src_oct[0],
+        src_oct[1],
+        src_oct[2],
+        src_oct[3],
+        src_oct[4],
+        src_oct[5],
+        src_oct[6],
+        src_oct[7],
+        src_oct[8],
+        src_oct[9],
+        src_oct[10],
+        src_oct[11],
+        src_oct[12],
+        src_oct[13],
+        src_oct[14],
+        src_oct[15],
+        dst_oct[0],
+        dst_oct[1],
+        dst_oct[2],
+        dst_oct[3],
+        dst_oct[4],
+        dst_oct[5],
+        dst_oct[6],
+        dst_oct[7],
+        dst_oct[8],
+        dst_oct[9],
+        dst_oct[10],
+        dst_oct[11],
+        dst_oct[12],
+        dst_oct[13],
+        dst_oct[14],
+        dst_oct[15],
+    ];
+    out[..IPV6_HEADER_LEN].copy_from_slice(&hdr);
 
-    // Hop Limit (TTL - 1)
-    v6_packet.push(ttl.saturating_sub(1));
+    // Copy payload into output buffer, then adjust checksums in-place
+    let payload_out = &mut out[IPV6_HEADER_LEN..out_len];
+    payload_out.copy_from_slice(payload);
 
-    // Source IPv6
-    v6_packet.extend_from_slice(&src_v6.octets());
-    // Destination IPv6
-    v6_packet.extend_from_slice(&dst_v6.octets());
-
-    // Translate payload
     match protocol {
         PROTO_ICMP => {
-            let translated_payload =
-                translate_icmpv4_to_icmpv6(payload, src_v6, dst_v6, payload_len)?;
-            v6_packet.extend_from_slice(&translated_payload);
+            // ICMP requires full recompute; modify payload_out in-place
+            if !translate_icmpv4_to_icmpv6_inplace(payload_out, src_v6, dst_v6, payload_len) {
+                return None;
+            }
         }
         PROTO_TCP => {
-            let mut tcp_payload = payload.to_vec();
             adjust_tcp_checksum_v4_to_v6(
-                &mut tcp_payload,
+                payload_out,
                 src_ip,
                 dst_ip,
                 PROTO_TCP,
@@ -115,12 +141,10 @@ pub fn ipv4_to_ipv6(
                 dst_v6,
                 next_header,
             );
-            v6_packet.extend_from_slice(&tcp_payload);
         }
         PROTO_UDP => {
-            let mut udp_payload = payload.to_vec();
             adjust_udp_checksum_v4_to_v6(
-                &mut udp_payload,
+                payload_out,
                 src_ip,
                 dst_ip,
                 PROTO_UDP,
@@ -128,25 +152,36 @@ pub fn ipv4_to_ipv6(
                 dst_v6,
                 next_header,
             );
-            v6_packet.extend_from_slice(&udp_payload);
         }
-        _ => {
-            // Pass through other protocols unchanged
-            v6_packet.extend_from_slice(payload);
-        }
+        _ => {} // payload already copied unchanged
     }
 
-    Some(v6_packet)
+    Some(out_len)
 }
 
-/// Translate an IPv6 packet to IPv4.
-///
-/// Returns the translated IPv4 packet, or `None` if the packet should be dropped.
-pub fn ipv6_to_ipv4(
+/// Translate an IPv4 packet to IPv6 (allocating version for backward compatibility).
+pub fn ipv4_to_ipv6(
     packet: &[u8],
     clat_prefix: Ipv6Addr,
     plat_prefix: Ipv6Addr,
 ) -> Option<Vec<u8>> {
+    // Allocate worst-case buffer: IPv6 header + max payload
+    let max_out = IPV6_HEADER_LEN + packet.len();
+    let mut buf = vec![0u8; max_out];
+    let n = ipv4_to_ipv6_buf(packet, clat_prefix, plat_prefix, &mut buf)?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Translate an IPv6 packet to IPv4, writing into the provided buffer.
+///
+/// Returns the number of bytes written, or `None` if the packet should be dropped.
+pub fn ipv6_to_ipv4_buf(
+    packet: &[u8],
+    clat_prefix: Ipv6Addr,
+    plat_prefix: Ipv6Addr,
+    out: &mut [u8],
+) -> Option<usize> {
     if packet.len() < IPV6_HEADER_LEN {
         return None;
     }
@@ -160,7 +195,6 @@ pub fn ipv6_to_ipv4(
     let next_header = packet[6];
     let hop_limit = packet[7];
 
-    // Drop packets with expired hop limit (RFC 6145 §4).
     if hop_limit <= 1 {
         return None;
     }
@@ -173,7 +207,6 @@ pub fn ipv6_to_ipv4(
     dst_octets.copy_from_slice(&packet[24..40]);
     let dst_v6 = Ipv6Addr::from(dst_octets);
 
-    // Verify prefixes: src should match PLAT, dst should match CLAT
     if !addr::matches_prefix_96(src_v6, plat_prefix) {
         return None;
     }
@@ -181,7 +214,6 @@ pub fn ipv6_to_ipv4(
         return None;
     }
 
-    // Extract embedded IPv4 addresses
     let src_ip = addr::extract_ipv4_from_ipv6(src_v6);
     let dst_ip = addr::extract_ipv4_from_ipv6(dst_v6);
 
@@ -191,58 +223,64 @@ pub fn ipv6_to_ipv4(
     }
     let payload = &packet[payload_start..payload_start + payload_len];
 
-    // Map protocol: ICMPv6 -> ICMP
     let protocol = match next_header {
         PROTO_ICMPV6 => PROTO_ICMP,
         p => p,
     };
 
-    if IPV4_HEADER_MIN_LEN + payload_len > u16::MAX as usize {
+    let out_len = IPV4_HEADER_MIN_LEN + payload_len;
+    if out_len > u16::MAX as usize || out.len() < out_len {
         return None;
     }
-    let total_len = (IPV4_HEADER_MIN_LEN + payload_len) as u16;
+    let total_len = out_len as u16;
 
-    // Build IPv4 header
+    // Build IPv4 header as fixed array
     let tos = ((packet[0] & 0x0F) << 4) | (packet[1] >> 4);
-    let mut v4_packet = Vec::with_capacity(total_len as usize);
-
-    // Version + IHL (5 = no options)
-    v4_packet.push(0x45);
-    // TOS
-    v4_packet.push(tos);
-    // Total Length
-    v4_packet.extend_from_slice(&total_len.to_be_bytes());
-    // Identification (0)
-    v4_packet.extend_from_slice(&[0x00, 0x00]);
-    // Flags + Fragment Offset (DF=1, no fragmentation)
-    v4_packet.extend_from_slice(&[0x40, 0x00]);
-    // TTL
-    v4_packet.push(hop_limit.saturating_sub(1));
-    // Protocol
-    v4_packet.push(protocol);
-    // Header Checksum (placeholder)
-    v4_packet.extend_from_slice(&[0x00, 0x00]);
-    // Source IP
-    v4_packet.extend_from_slice(&src_ip.octets());
-    // Destination IP
-    v4_packet.extend_from_slice(&dst_ip.octets());
+    let tl = total_len.to_be_bytes();
+    let src_oct = src_ip.octets();
+    let dst_oct = dst_ip.octets();
+    let hdr: [u8; IPV4_HEADER_MIN_LEN] = [
+        0x45,
+        tos,
+        tl[0],
+        tl[1],
+        0x00,
+        0x00, // identification
+        0x40,
+        0x00, // DF, no fragment
+        hop_limit.saturating_sub(1),
+        protocol,
+        0x00,
+        0x00, // checksum placeholder
+        src_oct[0],
+        src_oct[1],
+        src_oct[2],
+        src_oct[3],
+        dst_oct[0],
+        dst_oct[1],
+        dst_oct[2],
+        dst_oct[3],
+    ];
+    out[..IPV4_HEADER_MIN_LEN].copy_from_slice(&hdr);
 
     // Compute IPv4 header checksum
-    let hdr_cksum = checksum::ipv4_header_checksum(&v4_packet[..IPV4_HEADER_MIN_LEN]);
-    v4_packet[10] = (hdr_cksum >> 8) as u8;
-    v4_packet[11] = (hdr_cksum & 0xFF) as u8;
+    let hdr_cksum = checksum::ipv4_header_checksum(&out[..IPV4_HEADER_MIN_LEN]);
+    out[10] = (hdr_cksum >> 8) as u8;
+    out[11] = (hdr_cksum & 0xFF) as u8;
 
-    // Translate payload
+    // Copy payload into output buffer, then adjust checksums in-place
+    let payload_out = &mut out[IPV4_HEADER_MIN_LEN..out_len];
+    payload_out.copy_from_slice(payload);
+
     match next_header {
         PROTO_ICMPV6 => {
-            let translated_payload =
-                translate_icmpv6_to_icmpv4(payload, src_v6, dst_v6, payload_len)?;
-            v4_packet.extend_from_slice(&translated_payload);
+            if !translate_icmpv6_to_icmpv4_inplace(payload_out, src_v6, dst_v6, payload_len) {
+                return None;
+            }
         }
         PROTO_TCP => {
-            let mut tcp_payload = payload.to_vec();
             adjust_tcp_checksum_v6_to_v4(
-                &mut tcp_payload,
+                payload_out,
                 src_v6,
                 dst_v6,
                 next_header,
@@ -250,12 +288,10 @@ pub fn ipv6_to_ipv4(
                 dst_ip,
                 protocol,
             );
-            v4_packet.extend_from_slice(&tcp_payload);
         }
         PROTO_UDP => {
-            let mut udp_payload = payload.to_vec();
             adjust_udp_checksum_v6_to_v4(
-                &mut udp_payload,
+                payload_out,
                 src_v6,
                 dst_v6,
                 next_header,
@@ -263,110 +299,126 @@ pub fn ipv6_to_ipv4(
                 dst_ip,
                 protocol,
             );
-            v4_packet.extend_from_slice(&udp_payload);
         }
-        _ => {
-            v4_packet.extend_from_slice(payload);
-        }
+        _ => {} // payload already copied unchanged
     }
 
-    Some(v4_packet)
+    Some(out_len)
 }
 
-/// Translate ICMPv4 payload to ICMPv6.
-fn translate_icmpv4_to_icmpv6(
-    payload: &[u8],
+/// Translate an IPv6 packet to IPv4 (allocating version for backward compatibility).
+pub fn ipv6_to_ipv4(
+    packet: &[u8],
+    clat_prefix: Ipv6Addr,
+    plat_prefix: Ipv6Addr,
+) -> Option<Vec<u8>> {
+    let max_out = packet.len(); // IPv4 is always <= IPv6
+    let mut buf = vec![0u8; max_out];
+    let n = ipv6_to_ipv4_buf(packet, clat_prefix, plat_prefix, &mut buf)?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Translate ICMPv4 payload to ICMPv6 in-place (no allocation).
+///
+/// The buffer must already contain the ICMPv4 payload data.
+/// Returns `false` if the packet should be dropped.
+fn translate_icmpv4_to_icmpv6_inplace(
+    buf: &mut [u8],
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
     payload_len: usize,
-) -> Option<Vec<u8>> {
-    if payload.len() < 4 {
-        return None;
+) -> bool {
+    if buf.len() < 4 {
+        return false;
     }
 
     // Validate incoming ICMPv4 checksum to prevent laundering (M-1).
-    // ICMP checksums are fully recomputed during translation, so a
-    // corrupted packet would receive a fresh valid checksum without this check.
-    if checksum::internet_checksum(payload) != 0 {
-        return None;
+    if checksum::internet_checksum(buf) != 0 {
+        return false;
     }
 
-    let mapping = icmp::icmpv4_to_icmpv6(payload[0], payload[1])?;
+    let mapping = match icmp::icmpv4_to_icmpv6(buf[0], buf[1]) {
+        Some(m) => m,
+        None => return false,
+    };
 
-    let mut result = payload.to_vec();
-    result[0] = mapping.icmp_type;
-    result[1] = mapping.icmp_code;
-    // Zero checksum before recalculating
-    result[2] = 0;
-    result[3] = 0;
+    buf[0] = mapping.icmp_type;
+    buf[1] = mapping.icmp_code;
+    buf[2] = 0;
+    buf[3] = 0;
 
     // ICMPv6 checksum includes pseudo-header
     let pseudo_sum =
         checksum::ipv6_pseudo_header_sum(src_v6, dst_v6, PROTO_ICMPV6, payload_len as u32);
     let mut sum = pseudo_sum;
     let mut i = 0;
-    while i + 1 < result.len() {
-        sum += u32::from(u16::from_be_bytes([result[i], result[i + 1]]));
+    while i + 1 < buf.len() {
+        sum += u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]));
         i += 2;
     }
-    if i < result.len() {
-        sum += u32::from(result[i]) << 8;
+    if i < buf.len() {
+        sum += u32::from(buf[i]) << 8;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     let cksum = !(sum as u16);
-    result[2] = (cksum >> 8) as u8;
-    result[3] = (cksum & 0xFF) as u8;
+    buf[2] = (cksum >> 8) as u8;
+    buf[3] = (cksum & 0xFF) as u8;
 
-    Some(result)
+    true
 }
 
-/// Translate ICMPv6 payload to ICMPv4.
-fn translate_icmpv6_to_icmpv4(
-    payload: &[u8],
+/// Translate ICMPv6 payload to ICMPv4 in-place (no allocation).
+///
+/// The buffer must already contain the ICMPv6 payload data.
+/// Returns `false` if the packet should be dropped.
+fn translate_icmpv6_to_icmpv4_inplace(
+    buf: &mut [u8],
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
     payload_len: usize,
-) -> Option<Vec<u8>> {
-    if payload.len() < 4 {
-        return None;
+) -> bool {
+    if buf.len() < 4 {
+        return false;
     }
 
-    // Validate incoming ICMPv6 checksum (includes pseudo-header) to prevent laundering.
+    // Validate incoming ICMPv6 checksum (includes pseudo-header).
     let pseudo_sum =
         checksum::ipv6_pseudo_header_sum(src_v6, dst_v6, PROTO_ICMPV6, payload_len as u32);
     let mut sum = pseudo_sum;
     let mut i = 0;
-    while i + 1 < payload.len() {
-        sum += u32::from(u16::from_be_bytes([payload[i], payload[i + 1]]));
+    while i + 1 < buf.len() {
+        sum += u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]));
         i += 2;
     }
-    if i < payload.len() {
-        sum += u32::from(payload[i]) << 8;
+    if i < buf.len() {
+        sum += u32::from(buf[i]) << 8;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     if sum as u16 != 0xFFFF {
-        return None;
+        return false;
     }
 
-    let mapping = icmp::icmpv6_to_icmpv4(payload[0], payload[1])?;
+    let mapping = match icmp::icmpv6_to_icmpv4(buf[0], buf[1]) {
+        Some(m) => m,
+        None => return false,
+    };
 
-    let mut result = payload.to_vec();
-    result[0] = mapping.icmp_type;
-    result[1] = mapping.icmp_code;
-    // Zero checksum before recalculating
-    result[2] = 0;
-    result[3] = 0;
+    buf[0] = mapping.icmp_type;
+    buf[1] = mapping.icmp_code;
+    buf[2] = 0;
+    buf[3] = 0;
 
     // ICMPv4 checksum does NOT include pseudo-header
-    let cksum = checksum::internet_checksum(&result);
-    result[2] = (cksum >> 8) as u8;
-    result[3] = (cksum & 0xFF) as u8;
+    let cksum = checksum::internet_checksum(buf);
+    buf[2] = (cksum >> 8) as u8;
+    buf[3] = (cksum & 0xFF) as u8;
 
-    Some(result)
+    true
 }
 
 /// Adjust TCP checksum when translating IPv4 -> IPv6.

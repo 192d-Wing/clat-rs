@@ -72,6 +72,9 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
     let mut v4_buf = [0u8; BUF_SIZE];
     let mut v6_buf = [0u8; BUF_SIZE];
+    // Pre-allocated output buffers — reused every packet, zero heap allocations
+    let mut v6_out = [0u8; BUF_SIZE];
+    let mut v4_out = [0u8; BUF_SIZE];
 
     loop {
         tokio::select! {
@@ -97,15 +100,15 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
                 let ipv4_packet = &v4_buf[..n];
 
-                if let Some(ipv6_packet) = nat64_core::translate::ipv4_to_ipv6(ipv4_packet, clat_prefix, plat_prefix)
+                if let Some(out_len) = nat64_core::translate::ipv4_to_ipv6_buf(ipv4_packet, clat_prefix, plat_prefix, &mut v6_out)
                 {
                     tracing::debug!(
                         event_type = "translation",
                         direction = "v4_to_v6",
-                        bytes = ipv6_packet.len(),
+                        bytes = out_len,
                         "translated IPv4 to IPv6"
                     );
-                    if let Err(e) = v6_tun.write_all(&ipv6_packet).await {
+                    if let Err(e) = v6_tun.write_all(&v6_out[..out_len]).await {
                         tracing::warn!("failed to write IPv6 packet to TUN: {e}");
                     }
                 }
@@ -119,15 +122,15 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
                 let ipv6_packet = &v6_buf[..n];
 
-                if let Some(ipv4_packet) = nat64_core::translate::ipv6_to_ipv4(ipv6_packet, clat_prefix, plat_prefix)
+                if let Some(out_len) = nat64_core::translate::ipv6_to_ipv4_buf(ipv6_packet, clat_prefix, plat_prefix, &mut v4_out)
                 {
                     tracing::debug!(
                         event_type = "translation",
                         direction = "v6_to_v4",
-                        bytes = ipv4_packet.len(),
+                        bytes = out_len,
                         "translated IPv6 to IPv4"
                     );
-                    if let Err(e) = v4_tun.write_all(&ipv4_packet).await {
+                    if let Err(e) = v4_tun.write_all(&v4_out[..out_len]).await {
                         tracing::warn!("failed to write IPv4 packet to TUN: {e}");
                     }
                 }

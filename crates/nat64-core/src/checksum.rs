@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Compute the Internet checksum (RFC 1071) over a byte slice.
+#[inline]
 pub fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i: usize = 0;
@@ -25,12 +26,14 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 
 /// Compute the IPv4 header checksum.
 /// `header` must be the raw IPv4 header bytes with the checksum field zeroed.
+#[inline]
 pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
     internet_checksum(header)
 }
 
 /// Build an IPv4 pseudo-header and return the partial checksum (not folded/complemented).
 /// Used for TCP/UDP checksum calculation.
+#[inline]
 pub fn ipv4_pseudo_header_sum(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, length: u16) -> u32 {
     let s: [u8; 4] = src.octets();
     let d: [u8; 4] = dst.octets();
@@ -46,6 +49,7 @@ pub fn ipv4_pseudo_header_sum(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, length
 
 /// Build an IPv6 pseudo-header and return the partial checksum (not folded/complemented).
 /// Used for TCP/UDP/ICMPv6 checksum calculation.
+#[inline]
 pub fn ipv6_pseudo_header_sum(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, length: u32) -> u32 {
     let s: [u8; 16] = src.octets();
     let d: [u8; 16] = dst.octets();
@@ -70,6 +74,7 @@ pub fn ipv6_pseudo_header_sum(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, len
 
 /// Incrementally update a checksum when replacing an IPv4 pseudo-header with IPv6.
 /// This adjusts the existing transport checksum for the new pseudo-header.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn adjust_checksum_v4_to_v6(
     old_checksum: u16,
@@ -97,6 +102,7 @@ pub fn adjust_checksum_v4_to_v6(
 }
 
 /// Incrementally update a checksum when replacing an IPv6 pseudo-header with IPv4.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn adjust_checksum_v6_to_v4(
     old_checksum: u16,
@@ -119,6 +125,7 @@ pub fn adjust_checksum_v6_to_v4(
 }
 
 /// Fold a u32 sum into a u16 with carry.
+#[inline]
 fn fold32(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
