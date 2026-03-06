@@ -23,6 +23,10 @@ pub struct Config {
     #[serde(default)]
     pub session: SessionConfig,
 
+    /// Ephemeral port range for NAT pool (default [1024, 65535])
+    #[serde(default = "default_port_range")]
+    pub port_range: [u16; 2],
+
     /// MTU (default 1500)
     #[serde(default = "default_mtu")]
     pub mtu: u16,
@@ -65,6 +69,9 @@ impl SessionConfig {
     }
 }
 
+fn default_port_range() -> [u16; 2] {
+    [1024, 65535]
+}
 fn default_mtu() -> u16 {
     1500
 }
@@ -99,6 +106,19 @@ impl Config {
         }
         for cidr in &self.ipv4_pool {
             nat64_core::prefix::parse_ipv4_cidr(cidr)?;
+        }
+        if self.port_range[0] < 1024 {
+            anyhow::bail!(
+                "port_range start must be >= 1024, got {}",
+                self.port_range[0]
+            );
+        }
+        if self.port_range[0] > self.port_range[1] {
+            anyhow::bail!(
+                "port_range start ({}) must be <= end ({})",
+                self.port_range[0],
+                self.port_range[1]
+            );
         }
         Ok(())
     }
@@ -140,6 +160,7 @@ uplink_interface: eth0
             "64:ff9b::".parse::<Ipv6Addr>().unwrap()
         );
         assert_eq!(config.mtu, 1500);
+        assert_eq!(config.port_range, [1024, 65535]);
         assert_eq!(config.session.max_sessions, 65536);
         assert_eq!(config.egress_interface(), "eth0");
     }
@@ -159,6 +180,7 @@ session:
   udp_timeout_secs: 120
   icmp_timeout_secs: 30
 mtu: 1280
+port_range: [2048, 32767]
 grpc_addr: "[::1]:9999"
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
@@ -166,6 +188,7 @@ grpc_addr: "[::1]:9999"
         assert_eq!(config.session.max_sessions, 1000);
         assert_eq!(config.session.tcp_timeout_secs, 3600);
         assert_eq!(config.mtu, 1280);
+        assert_eq!(config.port_range, [2048, 32767]);
         assert_eq!(config.egress_interface(), "eth1");
 
         let pool = config.parse_ipv4_pool().unwrap();
@@ -190,6 +213,32 @@ nat64_prefix: "64:ff9b::/64"
 ipv4_pool:
   - "198.51.100.0/24"
 uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_port_range_start_too_low() {
+        let yaml = r#"
+nat64_prefix: "64:ff9b::/96"
+ipv4_pool:
+  - "198.51.100.0/24"
+uplink_interface: eth0
+port_range: [80, 1024]
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_port_range_inverted() {
+        let yaml = r#"
+nat64_prefix: "64:ff9b::/96"
+ipv4_pool:
+  - "198.51.100.0/24"
+uplink_interface: eth0
+port_range: [50000, 10000]
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.validate().is_err());

@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let nat64_prefix = config.nat64_prefix();
     let pool_cidrs = config.parse_ipv4_pool()?;
-    let pool = Ipv4Pool::new(&pool_cidrs, (1024, 65535))?;
+    let pool = Ipv4Pool::new(&pool_cidrs, (config.port_range[0], config.port_range[1]))?;
 
     log::info!(
         "PLAT: NAT64 prefix {nat64_prefix}/96, pool {} addresses, max {} sessions",
