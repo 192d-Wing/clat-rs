@@ -158,13 +158,37 @@ where
             write!(
                 nist,
                 ",\"component\":\"{}\",\"pid\":{},\"hostname\":\"{}\"",
-                self.component, self.pid, self.hostname,
+                self.component,
+                self.pid,
+                escape_json_string(&self.hostname),
             )?;
             buf.insert_str(pos, &nist);
         }
 
         write!(writer, "{buf}")
     }
+}
+
+/// Escape a string for safe inclusion in a JSON string value.
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // Unicode escape for other control characters
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn gethostname() -> String {
