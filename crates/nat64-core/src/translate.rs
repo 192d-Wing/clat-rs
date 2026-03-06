@@ -34,6 +34,13 @@ pub fn ipv4_to_ipv6(
         return None;
     }
 
+    // Validate IPv4 header checksum to prevent checksum laundering (M-1).
+    // TUN devices deliver packets before kernel checksum verification,
+    // so corrupted packets could otherwise receive fresh valid checksums.
+    if checksum::internet_checksum(&packet[..ihl]) != 0 {
+        return None;
+    }
+
     let tos = packet[1];
     let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
     if packet.len() < total_len {
@@ -42,6 +49,11 @@ pub fn ipv4_to_ipv6(
 
     let protocol = packet[9];
     let ttl = packet[8];
+
+    // Drop packets that would expire after translation (TTL decrement)
+    if ttl <= 1 {
+        return None;
+    }
     let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
@@ -148,6 +160,11 @@ pub fn ipv6_to_ipv4(
     let next_header = packet[6];
     let hop_limit = packet[7];
 
+    // Drop packets with expired hop limit (RFC 6145 §4).
+    if hop_limit <= 1 {
+        return None;
+    }
+
     let mut src_octets = [0u8; 16];
     src_octets.copy_from_slice(&packet[8..24]);
     let src_v6 = Ipv6Addr::from(src_octets);
@@ -218,7 +235,8 @@ pub fn ipv6_to_ipv4(
     // Translate payload
     match next_header {
         PROTO_ICMPV6 => {
-            let translated_payload = translate_icmpv6_to_icmpv4(payload)?;
+            let translated_payload =
+                translate_icmpv6_to_icmpv4(payload, src_v6, dst_v6, payload_len)?;
             v4_packet.extend_from_slice(&translated_payload);
         }
         PROTO_TCP => {
@@ -266,6 +284,13 @@ fn translate_icmpv4_to_icmpv6(
         return None;
     }
 
+    // Validate incoming ICMPv4 checksum to prevent laundering (M-1).
+    // ICMP checksums are fully recomputed during translation, so a
+    // corrupted packet would receive a fresh valid checksum without this check.
+    if checksum::internet_checksum(payload) != 0 {
+        return None;
+    }
+
     let mapping = icmp::icmpv4_to_icmpv6(payload[0], payload[1])?;
 
     let mut result = payload.to_vec();
@@ -298,8 +323,32 @@ fn translate_icmpv4_to_icmpv6(
 }
 
 /// Translate ICMPv6 payload to ICMPv4.
-fn translate_icmpv6_to_icmpv4(payload: &[u8]) -> Option<Vec<u8>> {
+fn translate_icmpv6_to_icmpv4(
+    payload: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    payload_len: usize,
+) -> Option<Vec<u8>> {
     if payload.len() < 4 {
+        return None;
+    }
+
+    // Validate incoming ICMPv6 checksum (includes pseudo-header) to prevent laundering.
+    let pseudo_sum =
+        checksum::ipv6_pseudo_header_sum(src_v6, dst_v6, PROTO_ICMPV6, payload_len as u32);
+    let mut sum = pseudo_sum;
+    let mut i = 0;
+    while i + 1 < payload.len() {
+        sum += u32::from(u16::from_be_bytes([payload[i], payload[i + 1]]));
+        i += 2;
+    }
+    if i < payload.len() {
+        sum += u32::from(payload[i]) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    if sum as u16 != 0xFFFF {
         return None;
     }
 
@@ -976,9 +1025,26 @@ mod tests {
         pkt[10] = (cksum >> 8) as u8;
         pkt[11] = (cksum & 0xFF) as u8;
 
-        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
-        // hop limit should saturate at 0
-        assert_eq!(v6[7], 0);
+        // TTL <= 1 packets must be dropped (RFC 6145 §4)
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_ttl_one() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let mut pkt = make_ipv4_icmp_echo_request(src, dst);
+        pkt[8] = 1; // TTL=1
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (cksum >> 8) as u8;
+        pkt[11] = (cksum & 0xFF) as u8;
+
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
     }
 
     #[test]
@@ -1059,8 +1125,26 @@ mod tests {
         pkt[24..40]
             .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
 
-        let v4 = ipv6_to_ipv4(&pkt, clat, plat).unwrap();
-        assert_eq!(v4[8], 0); // TTL saturates at 0
+        // Hop limit <= 1 must be dropped (RFC 6145 §4)
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_hop_limit_one() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+
+        let mut pkt = vec![0u8; 44];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&4u16.to_be_bytes());
+        pkt[6] = 47; // GRE
+        pkt[7] = 1; // hop limit = 1
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
     }
 
     #[test]
@@ -1214,6 +1298,36 @@ mod tests {
         let hdr_cksum = checksum::ipv4_header_checksum(&pkt[..20]);
         pkt[10] = (hdr_cksum >> 8) as u8;
         pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    // --- M4: Checksum laundering prevention tests ---
+
+    #[test]
+    fn test_ipv4_bad_header_checksum_dropped() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let mut pkt = make_ipv4_icmp_echo_request(src, dst);
+        // Corrupt the header checksum
+        pkt[10] ^= 0xFF;
+
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_bad_icmp_checksum_dropped() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let mut pkt = make_ipv4_icmp_echo_request(src, dst);
+        // Corrupt the ICMP checksum (bytes 22-23)
+        pkt[22] ^= 0xFF;
 
         assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
     }
