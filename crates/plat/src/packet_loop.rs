@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -14,9 +15,85 @@ const BUF_SIZE: usize = 65536;
 const IPV6_HDR_LEN: usize = 40;
 /// Minimum IPv4 header length.
 const IPV4_HDR_LEN: usize = 20;
+/// IPv6 Fragment Extension Header length.
+const IPV6_FRAG_HDR_LEN: usize = 8;
+/// IPv6 Fragment Extension Header next-header value.
+const IPV6_NH_FRAGMENT: u8 = 44;
 
 /// Reap interval for expired sessions.
 const REAP_INTERVAL_SECS: u64 = 30;
+
+/// Global atomic counter for IPv4 Identification field on non-fragmented packets.
+static IPV4_ID_COUNTER: AtomicU16 = AtomicU16::new(1);
+
+/// Parsed IPv6 Fragment Extension Header info.
+struct Ipv6FragInfo {
+    /// Fragment offset in 8-byte units.
+    offset: u16,
+    /// More Fragments flag.
+    more_fragments: bool,
+    /// 32-bit Identification.
+    identification: u32,
+}
+
+/// Parse IPv6 extension header chain to find a Fragment Header.
+///
+/// Returns (actual transport next_header, payload start offset, optional fragment info).
+/// Currently only handles the Fragment Header (NH=44). Other extension headers
+/// (Hop-by-Hop=0, Routing=43, Destination=60) are skipped via their length fields.
+fn parse_ipv6_extensions(
+    packet: &[u8],
+    first_next_header: u8,
+) -> (u8, usize, Option<Ipv6FragInfo>) {
+    let mut nh = first_next_header;
+    let mut offset = IPV6_HDR_LEN;
+
+    loop {
+        match nh {
+            IPV6_NH_FRAGMENT => {
+                // Fragment Extension Header: 8 bytes
+                // [0]: Next Header
+                // [1]: Reserved
+                // [2-3]: Fragment Offset (13 bits) | Res (2 bits) | M (1 bit)
+                // [4-7]: Identification (32 bits)
+                if packet.len() < offset + IPV6_FRAG_HDR_LEN {
+                    return (nh, offset, None);
+                }
+                let real_nh = packet[offset];
+                let frag_field = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                let frag_offset = frag_field >> 3;
+                let more_fragments = (frag_field & 0x01) != 0;
+                let identification = u32::from_be_bytes([
+                    packet[offset + 4],
+                    packet[offset + 5],
+                    packet[offset + 6],
+                    packet[offset + 7],
+                ]);
+                let info = Ipv6FragInfo {
+                    offset: frag_offset,
+                    more_fragments,
+                    identification,
+                };
+                return (real_nh, offset + IPV6_FRAG_HDR_LEN, Some(info));
+            }
+            // Hop-by-Hop, Routing, Destination Options — skip using header length
+            0 | 43 | 60 => {
+                if packet.len() < offset + 2 {
+                    return (nh, offset, None);
+                }
+                let ext_nh = packet[offset];
+                let ext_len = (packet[offset + 1] as usize + 1) * 8;
+                if packet.len() < offset + ext_len {
+                    return (nh, offset, None);
+                }
+                nh = ext_nh;
+                offset += ext_len;
+            }
+            // Any other next_header is the transport protocol
+            _ => return (nh, offset, None),
+        }
+    }
+}
 
 /// Run the main PLAT NAT64 packet translation loop.
 pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
@@ -158,18 +235,30 @@ fn translate_v6_to_v4(
     src_bytes.copy_from_slice(&ipv6_packet[8..24]);
     let src_v6 = Ipv6Addr::from(src_bytes);
 
-    let next_header = ipv6_packet[6];
+    // Parse extension header chain to find Fragment Header and real transport protocol
+    let first_nh = ipv6_packet[6];
+    let (next_header, payload_offset, frag_info) = parse_ipv6_extensions(ipv6_packet, first_nh);
 
     // Check for ICMPv6 error messages — these need special handling
     // because the session lookup uses the embedded inner packet, not the outer.
-    if next_header == 58 {
-        let payload = &ipv6_packet[IPV6_HDR_LEN..];
+    if next_header == 58 && ipv6_packet.len() > payload_offset {
+        let payload = &ipv6_packet[payload_offset..];
         if !payload.is_empty() && is_icmpv6_error(payload[0]) {
             return translate_icmpv6_error_to_v4(ipv6_packet, payload, nat64_prefix, state);
         }
     }
 
-    let (src_port, dst_port) = extract_ports(next_header, &ipv6_packet[IPV6_HDR_LEN..])?;
+    // Non-first fragments don't carry transport headers, so we can't do
+    // port-based session lookup. Drop them for now (full reassembly would
+    // be needed to handle these properly — see RFC 6146 §3.5.1).
+    if let Some(ref fi) = frag_info
+        && fi.offset != 0
+    {
+        log::debug!("dropping non-first IPv6 fragment (offset={})", fi.offset);
+        return None;
+    }
+
+    let (src_port, dst_port) = extract_ports(next_header, &ipv6_packet[payload_offset..])?;
 
     let key = SessionKey {
         src_v6,
@@ -198,11 +287,12 @@ fn translate_v6_to_v4(
     let dst_v4 = nat64_core::addr::extract_ipv4_from_ipv6(dst_v6);
     let src_v4 = binding.pool_addr;
 
-    let payload_len = u16::from_be_bytes([ipv6_packet[4], ipv6_packet[5]]) as usize;
-    if ipv6_packet.len() < IPV6_HDR_LEN + payload_len {
+    let v6_payload_len = u16::from_be_bytes([ipv6_packet[4], ipv6_packet[5]]) as usize;
+    if ipv6_packet.len() < IPV6_HDR_LEN + v6_payload_len {
         return None;
     }
-    let payload = &ipv6_packet[IPV6_HDR_LEN..IPV6_HDR_LEN + payload_len];
+    // The transport payload starts after any extension headers
+    let payload = &ipv6_packet[payload_offset..IPV6_HDR_LEN + v6_payload_len];
 
     // Map ICMPv6 -> ICMP protocol number
     let ipv4_proto = match next_header {
@@ -210,17 +300,31 @@ fn translate_v6_to_v4(
         p => p,
     };
 
-    let total_len = (IPV4_HDR_LEN + payload_len) as u16;
+    let total_len = (IPV4_HDR_LEN + payload.len()) as u16;
     let hop_limit = ipv6_packet[7];
     let tos = ((ipv6_packet[0] & 0x0F) << 4) | (ipv6_packet[1] >> 4);
+
+    // Determine IPv4 fragment fields based on IPv6 Fragment Header presence
+    let (ipv4_id, ipv4_flags_frag) = if let Some(ref fi) = frag_info {
+        // Fragmented: DF=0, copy fragment offset and MF flag.
+        // Use lower 16 bits of IPv6 identification as IPv4 ID.
+        let id = fi.identification as u16;
+        let mf = if fi.more_fragments { 0x2000u16 } else { 0 };
+        let frag_off = fi.offset; // already in 8-byte units
+        (id, mf | frag_off)
+    } else {
+        // Not fragmented: DF=1, no fragment offset.
+        let id = IPV4_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        (id, 0x4000u16) // DF bit set
+    };
 
     let mut pkt = Vec::with_capacity(total_len as usize);
     // IPv4 header
     pkt.push(0x45); // version + IHL
     pkt.push(tos);
     pkt.extend_from_slice(&total_len.to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00]); // identification
-    pkt.extend_from_slice(&[0x40, 0x00]); // DF, no fragment
+    pkt.extend_from_slice(&ipv4_id.to_be_bytes());
+    pkt.extend_from_slice(&ipv4_flags_frag.to_be_bytes());
     pkt.push(hop_limit.saturating_sub(1));
     pkt.push(ipv4_proto);
     pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
@@ -341,10 +445,27 @@ fn translate_v4_to_v6(
 
     let payload = &ipv4_packet[ihl..total_len];
 
+    // Parse IPv4 fragment fields
+    let flags_frag = u16::from_be_bytes([ipv4_packet[6], ipv4_packet[7]]);
+    let ipv4_mf = (flags_frag & 0x2000) != 0;
+    let ipv4_frag_offset = flags_frag & 0x1FFF; // in 8-byte units
+    let ipv4_id = u16::from_be_bytes([ipv4_packet[4], ipv4_packet[5]]);
+    let is_fragment = ipv4_mf || ipv4_frag_offset != 0;
+
     // Check for ICMPv4 error messages — these need special handling
     // because the session lookup uses the embedded inner packet, not the outer.
     if protocol == 1 && !payload.is_empty() && is_icmpv4_error(payload[0]) {
         return translate_icmpv4_error_to_v6(ipv4_packet, payload, nat64_prefix, state);
+    }
+
+    // Non-first IPv4 fragments don't carry transport headers.
+    // Drop them (same as v6→v4 path — full reassembly not implemented).
+    if ipv4_frag_offset != 0 {
+        log::debug!(
+            "dropping non-first IPv4 fragment (offset={})",
+            ipv4_frag_offset
+        );
+        return None;
     }
 
     // Extract destination port for reverse lookup
@@ -376,20 +497,37 @@ fn translate_v4_to_v6(
     };
 
     let payload_len = payload.len();
+    let frag_hdr_len = if is_fragment { IPV6_FRAG_HDR_LEN } else { 0 };
     let ttl = ipv4_packet[8];
     let tos = ipv4_packet[1];
 
-    let mut pkt = Vec::with_capacity(IPV6_HDR_LEN + payload_len);
-    // IPv6 header
+    let mut pkt = Vec::with_capacity(IPV6_HDR_LEN + frag_hdr_len + payload_len);
+    // IPv6 header — if fragmented, next_header points to Fragment Header (44)
+    let v6_nh_field = if is_fragment {
+        IPV6_NH_FRAGMENT
+    } else {
+        ipv6_next_header
+    };
     pkt.push(0x60 | (tos >> 4));
     pkt.push(tos << 4);
     pkt.push(0x00);
     pkt.push(0x00);
-    pkt.extend_from_slice(&(payload_len as u16).to_be_bytes());
-    pkt.push(ipv6_next_header);
+    pkt.extend_from_slice(&((frag_hdr_len + payload_len) as u16).to_be_bytes());
+    pkt.push(v6_nh_field);
     pkt.push(ttl.saturating_sub(1));
     pkt.extend_from_slice(&src_v6.octets());
     pkt.extend_from_slice(&dst_v6.octets());
+
+    // Insert IPv6 Fragment Extension Header if this was a fragmented IPv4 packet
+    if is_fragment {
+        pkt.push(ipv6_next_header); // real next header (transport)
+        pkt.push(0); // reserved
+        let mf_bit: u16 = if ipv4_mf { 1 } else { 0 };
+        let frag_field = (ipv4_frag_offset << 3) | mf_bit;
+        pkt.extend_from_slice(&frag_field.to_be_bytes());
+        // Identification: expand 16-bit IPv4 ID to 32-bit
+        pkt.extend_from_slice(&(u32::from(ipv4_id)).to_be_bytes());
+    }
 
     // Translate and append payload
     match protocol {
@@ -1834,5 +1972,316 @@ mod tests {
             build_icmpv6_error(router_v6, client_v6, 1, 0, [0, 0, 0, 0], &short_inner);
 
         assert!(translate_v6_to_v4(&icmpv6_error, prefix, &state).is_none());
+    }
+
+    // --- Fragment handling tests ---
+
+    /// Build an IPv6 packet with a Fragment Extension Header.
+    /// The fragment header is inserted between the IPv6 header and the transport payload.
+    fn build_ipv6_with_frag_header(
+        src_v6: Ipv6Addr,
+        dst_v6: Ipv6Addr,
+        transport_nh: u8,
+        frag_offset: u16,
+        more_fragments: bool,
+        identification: u32,
+        transport_payload: &[u8],
+    ) -> Vec<u8> {
+        let frag_hdr_len = 8;
+        let payload_len = (frag_hdr_len + transport_payload.len()) as u16;
+        let mut pkt = Vec::with_capacity(IPV6_HDR_LEN + payload_len as usize);
+
+        // IPv6 header — next_header = 44 (Fragment)
+        pkt.push(0x60);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.push(IPV6_NH_FRAGMENT); // 44
+        pkt.push(64); // hop limit
+        pkt.extend_from_slice(&src_v6.octets());
+        pkt.extend_from_slice(&dst_v6.octets());
+
+        // Fragment Extension Header (8 bytes)
+        pkt.push(transport_nh); // real next header
+        pkt.push(0); // reserved
+        let mf = if more_fragments { 1u16 } else { 0 };
+        let frag_field = (frag_offset << 3) | mf;
+        pkt.extend_from_slice(&frag_field.to_be_bytes());
+        pkt.extend_from_slice(&identification.to_be_bytes());
+
+        // Transport payload
+        pkt.extend_from_slice(transport_payload);
+        pkt
+    }
+
+    /// Build a minimal IPv4 fragmented packet.
+    fn build_ipv4_fragment(
+        src_v4: Ipv4Addr,
+        dst_v4: Ipv4Addr,
+        protocol: u8,
+        ipv4_id: u16,
+        frag_offset: u16,
+        more_fragments: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total_len = (IPV4_HDR_LEN + payload.len()) as u16;
+        let mut pkt = Vec::with_capacity(total_len as usize);
+
+        pkt.push(0x45);
+        pkt.push(0x00);
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&ipv4_id.to_be_bytes());
+        let mf = if more_fragments { 0x2000u16 } else { 0 };
+        let flags_frag = mf | frag_offset;
+        pkt.extend_from_slice(&flags_frag.to_be_bytes());
+        pkt.push(64); // TTL
+        pkt.push(protocol);
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&src_v4.octets());
+        pkt.extend_from_slice(&dst_v4.octets());
+
+        let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&pkt[..IPV4_HDR_LEN]);
+        pkt[10] = (hdr_cksum >> 8) as u8;
+        pkt[11] = (hdr_cksum & 0xFF) as u8;
+
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn test_parse_ipv6_extensions_no_fragment() {
+        // Normal IPv6/TCP packet — no extension headers
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(1, 1, 1, 1));
+        let pkt = build_ipv6_tcp_syn(src, dst, 12345, 80);
+        let (nh, offset, frag) = parse_ipv6_extensions(&pkt, pkt[6]);
+        assert_eq!(nh, 6); // TCP
+        assert_eq!(offset, IPV6_HDR_LEN);
+        assert!(frag.is_none());
+    }
+
+    #[test]
+    fn test_parse_ipv6_extensions_with_fragment() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "64:ff9b::1.1.1.1".parse().unwrap();
+        // TCP SYN payload (20 bytes)
+        let tcp_payload = {
+            let mut t = vec![0u8; 20];
+            t[0] = 0x30;
+            t[1] = 0x39; // src port 12345
+            t[2] = 0x00;
+            t[3] = 0x50; // dst port 80
+            t[12] = 0x50; // data offset 5 (20 bytes)
+            t[13] = 0x02; // SYN
+            t
+        };
+        let pkt = build_ipv6_with_frag_header(src, dst, 6, 0, true, 0xDEADBEEF, &tcp_payload);
+        let (nh, offset, frag) = parse_ipv6_extensions(&pkt, pkt[6]);
+        assert_eq!(nh, 6); // TCP (parsed through fragment header)
+        assert_eq!(offset, IPV6_HDR_LEN + IPV6_FRAG_HDR_LEN);
+        let fi = frag.unwrap();
+        assert_eq!(fi.offset, 0);
+        assert!(fi.more_fragments);
+        assert_eq!(fi.identification, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_v6_to_v4_first_fragment_translates() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_v4 = Ipv4Addr::new(93, 184, 216, 34);
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, dst_v4);
+
+        // Build a first fragment (offset=0, MF=1) with TCP header
+        let tcp_payload = {
+            let mut t = vec![0u8; 20];
+            t[0] = 0x30;
+            t[1] = 0x39; // src port 12345
+            t[2] = 0x00;
+            t[3] = 0x50; // dst port 80
+            t[12] = 0x50; // data offset
+            t[13] = 0x02; // SYN
+            t
+        };
+        let pkt = build_ipv6_with_frag_header(src_v6, dst_v6, 6, 0, true, 0x12345678, &tcp_payload);
+
+        let v4 = translate_v6_to_v4(&pkt, prefix, &state).unwrap();
+
+        // Verify IPv4 basics
+        assert_eq!(v4[0] >> 4, 4);
+        assert_eq!(v4[9], 6); // TCP
+        assert!(verify_ipv4_checksum(&v4));
+
+        // DF should be 0 (fragmented), MF should be 1
+        let flags_frag = u16::from_be_bytes([v4[6], v4[7]]);
+        assert_eq!(flags_frag & 0x4000, 0, "DF should be 0 for fragments");
+        assert_ne!(flags_frag & 0x2000, 0, "MF should be 1");
+        assert_eq!(flags_frag & 0x1FFF, 0, "fragment offset should be 0");
+
+        // Identification should be lower 16 bits of 0x12345678
+        let id = u16::from_be_bytes([v4[4], v4[5]]);
+        assert_eq!(id, 0x5678);
+
+        // Destination should be correct
+        let out_dst = Ipv4Addr::new(v4[16], v4[17], v4[18], v4[19]);
+        assert_eq!(out_dst, dst_v4);
+    }
+
+    #[test]
+    fn test_v6_to_v4_non_first_fragment_dropped() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_v4 = Ipv4Addr::new(93, 184, 216, 34);
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, dst_v4);
+
+        // Non-first fragment (offset=185, which is 1480/8)
+        let data = vec![0u8; 100];
+        let pkt = build_ipv6_with_frag_header(src_v6, dst_v6, 6, 185, false, 0xAAAABBBB, &data);
+
+        // Should be dropped (no transport headers to do session lookup)
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+    }
+
+    #[test]
+    fn test_v6_to_v4_unfragmented_has_df_set() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_v4 = Ipv4Addr::new(1, 1, 1, 1);
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, dst_v4);
+
+        // Normal unfragmented packet
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 12345, 80);
+        let v4 = translate_v6_to_v4(&pkt, prefix, &state).unwrap();
+
+        let flags_frag = u16::from_be_bytes([v4[6], v4[7]]);
+        assert_ne!(flags_frag & 0x4000, 0, "DF should be set for unfragmented");
+        assert_eq!(flags_frag & 0x2000, 0, "MF should be 0");
+        assert_eq!(flags_frag & 0x1FFF, 0, "fragment offset should be 0");
+
+        // Identification should be non-zero (from counter)
+        let id = u16::from_be_bytes([v4[4], v4[5]]);
+        assert_ne!(id, 0);
+    }
+
+    #[test]
+    fn test_v4_to_v6_first_fragment_gets_frag_header() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let server_v4 = Ipv4Addr::new(93, 184, 216, 34);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+
+        // First, establish a session
+        let setup = build_ipv6_tcp_syn(client_v6, server_v6, 54321, 80);
+        let v4_setup = translate_v6_to_v4(&setup, prefix, &state).unwrap();
+        let pool_addr = Ipv4Addr::new(v4_setup[12], v4_setup[13], v4_setup[14], v4_setup[15]);
+        let mapped_port = u16::from_be_bytes([v4_setup[20], v4_setup[21]]);
+
+        // Build a fragmented IPv4 response: first fragment (offset=0, MF=1)
+        let mut tcp_data = vec![0u8; 20];
+        tcp_data[0] = 0x00;
+        tcp_data[1] = 0x50; // src port 80
+        tcp_data[2] = (mapped_port >> 8) as u8;
+        tcp_data[3] = (mapped_port & 0xFF) as u8; // dst port = mapped
+        tcp_data[12] = 0x50; // data offset
+        tcp_data[13] = 0x12; // SYN+ACK
+
+        let v4_frag = build_ipv4_fragment(server_v4, pool_addr, 6, 0xABCD, 0, true, &tcp_data);
+
+        let v6 = translate_v4_to_v6(&v4_frag, prefix, &state).unwrap();
+
+        // IPv6 next_header should be 44 (Fragment)
+        assert_eq!(v6[6], IPV6_NH_FRAGMENT);
+
+        // Fragment Extension Header at offset 40
+        assert_eq!(v6[IPV6_HDR_LEN], 6); // real NH = TCP
+        let frag_field = u16::from_be_bytes([v6[IPV6_HDR_LEN + 2], v6[IPV6_HDR_LEN + 3]]);
+        let offset = frag_field >> 3;
+        let mf = frag_field & 1;
+        assert_eq!(offset, 0, "fragment offset should be 0");
+        assert_eq!(mf, 1, "MF should be set");
+
+        // Identification should be 0x0000ABCD (expanded from 16-bit)
+        let id = u32::from_be_bytes([
+            v6[IPV6_HDR_LEN + 4],
+            v6[IPV6_HDR_LEN + 5],
+            v6[IPV6_HDR_LEN + 6],
+            v6[IPV6_HDR_LEN + 7],
+        ]);
+        assert_eq!(id, 0x0000ABCD);
+
+        // Payload length should include fragment header + transport
+        let plen = u16::from_be_bytes([v6[4], v6[5]]) as usize;
+        assert_eq!(plen, IPV6_FRAG_HDR_LEN + tcp_data.len());
+    }
+
+    #[test]
+    fn test_v4_to_v6_non_first_fragment_dropped() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+
+        // Non-first IPv4 fragment (offset=185, MF=0) — no transport headers
+        let data = vec![0u8; 100];
+        let v4 = build_ipv4_fragment(
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(198, 51, 100, 1),
+            6,
+            0x1234,
+            185,
+            false,
+            &data,
+        );
+
+        assert!(translate_v4_to_v6(&v4, prefix, &state).is_none());
+    }
+
+    #[test]
+    fn test_v4_to_v6_unfragmented_no_frag_header() {
+        let state = test_state();
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let server_v4 = Ipv4Addr::new(8, 8, 8, 8);
+        let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
+
+        // Establish session
+        let setup = build_ipv6_tcp_syn(client_v6, server_v6, 33333, 443);
+        let v4_setup = translate_v6_to_v4(&setup, prefix, &state).unwrap();
+        let pool_addr = Ipv4Addr::new(v4_setup[12], v4_setup[13], v4_setup[14], v4_setup[15]);
+        let mapped_port = u16::from_be_bytes([v4_setup[20], v4_setup[21]]);
+
+        // Build unfragmented IPv4 reply (DF=1, no MF, offset=0)
+        let mut tcp_data = vec![0u8; 20];
+        tcp_data[0] = 0x01;
+        tcp_data[1] = 0xBB; // src port 443
+        tcp_data[2] = (mapped_port >> 8) as u8;
+        tcp_data[3] = (mapped_port & 0xFF) as u8;
+        tcp_data[12] = 0x50;
+        tcp_data[13] = 0x12;
+
+        let total_len = (IPV4_HDR_LEN + tcp_data.len()) as u16;
+        let mut v4_pkt = Vec::with_capacity(total_len as usize);
+        v4_pkt.push(0x45);
+        v4_pkt.push(0x00);
+        v4_pkt.extend_from_slice(&total_len.to_be_bytes());
+        v4_pkt.extend_from_slice(&[0x00, 0x01]); // ID=1
+        v4_pkt.extend_from_slice(&[0x40, 0x00]); // DF=1, no fragment
+        v4_pkt.push(64);
+        v4_pkt.push(6); // TCP
+        v4_pkt.extend_from_slice(&[0, 0]);
+        v4_pkt.extend_from_slice(&server_v4.octets());
+        v4_pkt.extend_from_slice(&pool_addr.octets());
+        let hdr_cksum = nat64_core::checksum::ipv4_header_checksum(&v4_pkt[..IPV4_HDR_LEN]);
+        v4_pkt[10] = (hdr_cksum >> 8) as u8;
+        v4_pkt[11] = (hdr_cksum & 0xFF) as u8;
+        v4_pkt.extend_from_slice(&tcp_data);
+
+        let v6 = translate_v4_to_v6(&v4_pkt, prefix, &state).unwrap();
+
+        // Should NOT have a Fragment Extension Header — next_header should be TCP directly
+        assert_eq!(v6[6], 6); // TCP, not 44 (Fragment)
+        assert_eq!(v6.len(), IPV6_HDR_LEN + tcp_data.len()); // no extra 8 bytes
     }
 }
