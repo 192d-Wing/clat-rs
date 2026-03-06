@@ -31,8 +31,9 @@ pub struct Config {
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 
-    /// gRPC listen address
+    /// gRPC listen address (used by config file; CLI flag overrides at runtime)
     #[serde(default = "default_grpc_addr")]
+    #[allow(dead_code)]
     pub grpc_addr: String,
 
     /// Security settings

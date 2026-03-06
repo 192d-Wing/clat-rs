@@ -850,10 +850,7 @@ fn translate_icmpv6_error_to_v4(
 
     let inner_binding = {
         let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
-        match nat.sessions.lookup(&inner_key) {
-            Some(b) => b,
-            None => return None, // No existing session for inner flow; drop ICMP error
-        }
+        nat.sessions.lookup(&inner_key)?
     };
 
     // Build the translated inner IPv4 header
@@ -1943,6 +1940,27 @@ mod tests {
         //   src=server_v6 (64:ff9b::server), dst=client_v6
         let router_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
         let inner_v6_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 80, 44444);
+
+        // Pre-establish a session for the inner flow so the ICMP error lookup succeeds.
+        // The inner packet has src=server_v6, dst=client_v6, so we create a session
+        // with that exact key directly (translate_v6_to_v4 won't work because client_v6
+        // is not in the NAT64 prefix).
+        {
+            let mut nat = state.nat.lock().unwrap();
+            let crate::state::NatState { sessions, pool, .. } = &mut *nat;
+            let inner_key = SessionKey {
+                src_v6: server_v6,
+                dst_v6: client_v6,
+                protocol: 6, // TCP
+                src_port: 80,
+                dst_port: 44444,
+            };
+            assert!(matches!(
+                sessions.lookup_or_create(inner_key, pool),
+                crate::session::LookupResult::Created(_)
+            ));
+        }
+
         let icmpv6_error = build_icmpv6_error(
             router_v6,
             server_v6, // dst is in NAT64 prefix, so PLAT receives it
@@ -1985,6 +2003,23 @@ mod tests {
 
         // Same scenario: a return packet (src=server_v6, dst=client) triggered
         // a Packet Too Big. Error is sent to server_v6 (in NAT64 prefix).
+        // Pre-establish a session for the inner flow directly.
+        {
+            let mut nat = state.nat.lock().unwrap();
+            let crate::state::NatState { sessions, pool, .. } = &mut *nat;
+            let inner_key = SessionKey {
+                src_v6: server_v6,
+                dst_v6: client_v6,
+                protocol: 6, // TCP
+                src_port: 443,
+                dst_port: 55555,
+            };
+            assert!(matches!(
+                sessions.lookup_or_create(inner_key, pool),
+                crate::session::LookupResult::Created(_)
+            ));
+        }
+
         let router_v6: Ipv6Addr = "2001:db8:aaaa::1".parse().unwrap();
         let inner_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 443, 55555);
         let mtu_v6: u32 = 1280;
@@ -2139,15 +2174,15 @@ mod tests {
     }
 
     #[test]
-    fn test_icmpv6_error_creates_session_for_inner_flow() {
+    fn test_icmpv6_error_drops_without_existing_session() {
         let state = test_state();
         let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
         let server_v4 = Ipv4Addr::new(10, 0, 0, 1);
         let server_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, server_v4);
         let client_v6: Ipv6Addr = "2001:db8::99".parse().unwrap();
 
-        // No session pre-established. The ICMP error handler uses lookup_or_create
-        // so it will create a session for the inner flow on-the-fly.
+        // No session pre-established. The ICMP error handler uses lookup-only
+        // so it should drop the error when no session exists (prevents pool exhaustion).
         let router_v6: Ipv6Addr = "2001:db8:bbbb::1".parse().unwrap();
         let inner_pkt = build_ipv6_tcp_syn(server_v6, client_v6, 80, 11111);
         let icmpv6_error = build_icmpv6_error(
@@ -2160,7 +2195,7 @@ mod tests {
         );
 
         let result = translate_v6_to_v4(&icmpv6_error, prefix, &state);
-        assert!(result.is_some());
+        assert!(result.is_none());
     }
 
     #[test]

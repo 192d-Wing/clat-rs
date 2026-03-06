@@ -214,6 +214,7 @@ impl SessionTable {
     }
 
     /// Whether the table is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.forward.is_empty()
     }

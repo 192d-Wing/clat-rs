@@ -40,7 +40,9 @@ impl PacketMetrics {
 pub struct SharedState {
     prefix_tx: watch::Sender<Option<Ipv6Addr>>,
     prefix_rx: watch::Receiver<Option<Ipv6Addr>>,
+    #[allow(dead_code)]
     pub uplink_interface: String,
+    #[allow(dead_code)]
     pub egress_interface: String,
     translating: AtomicBool,
     pub total_translations: AtomicU64,
