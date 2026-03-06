@@ -14,8 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check (${{ matrix.arch }})
+  fmt:
+    name: Format (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/192d-wing/clat-rs/ci:latest
@@ -29,27 +29,75 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
-
-      - uses: Swatinem/rust-cache@v2
-
       - name: Format check
         run: task fmt-check
 
+  clippy:
+    name: Clippy (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/192d-wing/clat-rs/ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: task clippy
 
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/192d-wing/clat-rs/ci:latest
+    steps:
+      - uses: actions/checkout@v6
       - name: Audit
         run: task audit
 
+  test:
+    name: Test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/192d-wing/clat-rs/ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: task test
 
-      - name: Build
-        run: task build
-
+  coverage:
+    name: Coverage (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/192d-wing/clat-rs/ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
       - name: Coverage
         run: task coverage-lcov
-
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
