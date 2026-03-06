@@ -96,6 +96,10 @@ fn parse_ipv6_extensions(
 }
 
 /// Run the main PLAT NAT64 packet translation loop.
+///
+/// On SIGINT or SIGTERM, the loop exits gracefully: it stops accepting
+/// new packets, flushes all active sessions (returning pool bindings),
+/// and marks the daemon as no longer translating.
 pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
     // Get first pool address for the IPv4 TUN interface
     let first_pool_addr = {
@@ -135,6 +139,16 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     let mut reap_interval =
         tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
     reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(not(unix))]
+    let mut sigterm = {
+        // On non-Unix, create a future that never resolves as a placeholder
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        std::mem::forget(tx); // keep sender alive so recv() never returns None
+        rx
+    };
 
     loop {
         tokio::select! {
@@ -199,15 +213,28 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
             }
 
-            // Shutdown
+            // Shutdown on SIGINT
             _ = tokio::signal::ctrl_c() => {
-                log::info!("received shutdown signal, stopping PLAT");
+                log::info!("received SIGINT, shutting down PLAT");
+                break;
+            }
+
+            // Shutdown on SIGTERM (Unix only)
+            _ = sigterm.recv() => {
+                log::info!("received SIGTERM, shutting down PLAT");
                 break;
             }
         }
     }
 
+    // Graceful shutdown: flush all sessions and return pool bindings
     state.set_translating(false);
+    let flushed = {
+        let mut nat = state.nat.lock().unwrap();
+        let crate::state::NatState { sessions, pool, .. } = &mut *nat;
+        sessions.flush_all(pool)
+    };
+    log::info!("graceful shutdown complete: flushed {flushed} sessions");
     Ok(())
 }
 
