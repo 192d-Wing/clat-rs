@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::state::SharedState;
@@ -20,6 +21,9 @@ const IPV6_HDR_LEN: usize = 40;
 /// - `clat0` (IPv4-facing): receives IPv4 packets from clients
 /// - `clat6` (IPv6-facing): sends/receives translated IPv6 packets on the uplink
 ///
+/// Each direction runs as a dedicated task, eliminating select overhead
+/// and enabling true parallelism across cores.
+///
 /// Routing rules must direct NAT64-prefix and CLAT-prefix traffic through `clat6`.
 /// If no CLAT prefix is available at startup, waits for one to be set via gRPC.
 pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
@@ -28,7 +32,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
     // Create IPv4-facing TUN device using the first network for the interface address
     let (first_network, first_prefix_len) = networks[0];
-    let mut v4_tun = tun_device::create_tun(
+    let v4_tun = tun_device::create_tun(
         V4_TUN_NAME,
         config.clat_ipv4_addr,
         first_network,
@@ -37,7 +41,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     )?;
 
     // Create IPv6-facing TUN device for the uplink
-    let mut v6_tun = tun_device::create_v6_tun(V6_TUN_NAME, config.mtu)?;
+    let v6_tun = tun_device::create_v6_tun(V6_TUN_NAME, config.mtu)?;
 
     // Log additional networks (routes would be added via ip route in production)
     for (net, prefix) in &networks[1..] {
@@ -59,7 +63,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
         }
     }
 
-    let mut clat_prefix = state.current_prefix().unwrap();
+    let clat_prefix = state.current_prefix().unwrap();
     tracing::info!(
         event_type = "lifecycle",
         action = "packet_loop_start",
@@ -70,87 +74,131 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     );
     state.set_translating(true);
 
-    let mut v4_buf = [0u8; BUF_SIZE];
-    let mut v6_buf = [0u8; BUF_SIZE];
-    // Pre-allocated output buffers — reused every packet, zero heap allocations
-    let mut v6_out = [0u8; BUF_SIZE];
-    let mut v4_out = [0u8; BUF_SIZE];
+    // Split TUN devices into independent reader/writer halves.
+    // Each direction gets its own task — no 4-way select overhead per packet.
+    let (v4_writer, v4_reader) = v4_tun.split()?;
+    let (v6_writer, v6_reader) = v6_tun.split()?;
 
-    loop {
-        tokio::select! {
-            // Watch for prefix updates (hot-swap)
-            result = prefix_rx.changed() => {
-                if result.is_err() {
-                    tracing::warn!("prefix watch channel closed");
-                    break;
-                }
-                if let Some(new_prefix) = *prefix_rx.borrow_and_update()
-                    && new_prefix != clat_prefix
-                {
-                    tracing::info!("hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
-                    clat_prefix = new_prefix;
-                }
+    let v4_to_v6_handle = tokio::spawn(v4_to_v6_loop(
+        v4_reader,
+        v6_writer,
+        clat_prefix,
+        plat_prefix,
+        state.subscribe_prefix(),
+    ));
+    let v6_to_v4_handle = tokio::spawn(v6_to_v4_loop(
+        v6_reader,
+        v4_writer,
+        clat_prefix,
+        plat_prefix,
+        state.subscribe_prefix(),
+    ));
+
+    tokio::select! {
+        result = v4_to_v6_handle => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("v4→v6 task failed: {e}");
             }
-
-            // Read IPv4 packet from v4 TUN -> translate to IPv6 -> send out v6 TUN
-            result = v4_tun.read(&mut v4_buf) => {
-                let n = result?;
-                if n == 0 {
-                    continue;
-                }
-                let ipv4_packet = &v4_buf[..n];
-
-                if let Some(out_len) = nat64_core::translate::ipv4_to_ipv6_buf(ipv4_packet, clat_prefix, plat_prefix, &mut v6_out)
-                {
-                    tracing::debug!(
-                        event_type = "translation",
-                        direction = "v4_to_v6",
-                        bytes = out_len,
-                        "translated IPv4 to IPv6"
-                    );
-                    if let Err(e) = v6_tun.write_all(&v6_out[..out_len]).await {
-                        tracing::warn!("failed to write IPv6 packet to TUN: {e}");
-                    }
-                }
+        }
+        result = v6_to_v4_handle => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("v6→v4 task failed: {e}");
             }
-
-            // Read IPv6 packet from v6 TUN -> translate to IPv4 -> write to v4 TUN
-            result = v6_tun.read(&mut v6_buf) => {
-                let n = result?;
-                if n < IPV6_HDR_LEN {
-                    continue;
-                }
-                let ipv6_packet = &v6_buf[..n];
-
-                if let Some(out_len) = nat64_core::translate::ipv6_to_ipv4_buf(ipv6_packet, clat_prefix, plat_prefix, &mut v4_out)
-                {
-                    tracing::debug!(
-                        event_type = "translation",
-                        direction = "v6_to_v4",
-                        bytes = out_len,
-                        "translated IPv6 to IPv4"
-                    );
-                    if let Err(e) = v4_tun.write_all(&v4_out[..out_len]).await {
-                        tracing::warn!("failed to write IPv4 packet to TUN: {e}");
-                    }
-                }
-            }
-
-            // Handle shutdown signal
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!(
-                    event_type = "lifecycle",
-                    action = "packet_loop_stop",
-                    reason = "signal",
-                    "CLAT received shutdown signal"
-                );
-                break;
-            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!(
+                event_type = "lifecycle",
+                action = "packet_loop_stop",
+                reason = "signal",
+                "CLAT received shutdown signal"
+            );
         }
     }
 
     state.set_translating(false);
     Ok(())
+}
+
+/// Dedicated v4→v6 translation task.
+async fn v4_to_v6_loop(
+    mut reader: tun::DeviceReader,
+    mut writer: tun::DeviceWriter,
+    mut clat_prefix: Ipv6Addr,
+    plat_prefix: Ipv6Addr,
+    mut prefix_rx: watch::Receiver<Option<Ipv6Addr>>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; BUF_SIZE];
+    let mut out = [0u8; BUF_SIZE];
+
+    loop {
+        if prefix_rx.has_changed().unwrap_or(false)
+            && let Some(new_prefix) = *prefix_rx.borrow_and_update()
+            && new_prefix != clat_prefix
+        {
+            tracing::info!("v4→v6: hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
+            clat_prefix = new_prefix;
+        }
+
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            continue;
+        }
+
+        if let Some(out_len) =
+            nat64_core::translate::ipv4_to_ipv6_buf(&buf[..n], clat_prefix, plat_prefix, &mut out)
+        {
+            tracing::debug!(
+                event_type = "translation",
+                direction = "v4_to_v6",
+                bytes = out_len,
+                "translated IPv4 to IPv6"
+            );
+            if let Err(e) = writer.write_all(&out[..out_len]).await {
+                tracing::warn!("failed to write IPv6 packet to TUN: {e}");
+            }
+        }
+    }
+}
+
+/// Dedicated v6→v4 translation task.
+async fn v6_to_v4_loop(
+    mut reader: tun::DeviceReader,
+    mut writer: tun::DeviceWriter,
+    mut clat_prefix: Ipv6Addr,
+    plat_prefix: Ipv6Addr,
+    mut prefix_rx: watch::Receiver<Option<Ipv6Addr>>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; BUF_SIZE];
+    let mut out = [0u8; BUF_SIZE];
+
+    loop {
+        if prefix_rx.has_changed().unwrap_or(false)
+            && let Some(new_prefix) = *prefix_rx.borrow_and_update()
+            && new_prefix != clat_prefix
+        {
+            tracing::info!("v6→v4: hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
+            clat_prefix = new_prefix;
+        }
+
+        let n = reader.read(&mut buf).await?;
+        if n < IPV6_HDR_LEN {
+            continue;
+        }
+
+        if let Some(out_len) =
+            nat64_core::translate::ipv6_to_ipv4_buf(&buf[..n], clat_prefix, plat_prefix, &mut out)
+        {
+            tracing::debug!(
+                event_type = "translation",
+                direction = "v6_to_v4",
+                bytes = out_len,
+                "translated IPv6 to IPv4"
+            );
+            if let Err(e) = writer.write_all(&out[..out_len]).await {
+                tracing::warn!("failed to write IPv4 packet to TUN: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
