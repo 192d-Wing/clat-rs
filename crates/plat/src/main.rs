@@ -113,6 +113,14 @@ async fn main() -> anyhow::Result<()> {
         },
     ));
 
+    // Drop privileges after TUN creation (Linux only)
+    if config.security.drop_uid != 0 || config.security.drop_gid != 0 {
+        tun_device::drop_privileges(&tun_device::DropPrivileges {
+            uid: config.security.drop_uid,
+            gid: config.security.drop_gid,
+        })?;
+    }
+
     // Spawn gRPC control server
     let grpc_addr: SocketAddr = cli.grpc_addr.parse()?;
     let grpc_state = Arc::clone(&state);

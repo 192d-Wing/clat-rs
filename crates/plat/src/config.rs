@@ -57,6 +57,14 @@ pub struct SecurityConfig {
     /// Reject packets with reserved IPv6 sources (loopback, multicast, etc.).
     #[serde(default = "default_true")]
     pub reject_reserved_v6_src: bool,
+
+    /// Drop privileges to this UID after TUN creation (Linux only, 0 = disabled).
+    #[serde(default)]
+    pub drop_uid: u32,
+
+    /// Drop privileges to this GID after TUN creation (Linux only, 0 = disabled).
+    #[serde(default)]
+    pub drop_gid: u32,
 }
 
 impl Default for SecurityConfig {
@@ -66,6 +74,8 @@ impl Default for SecurityConfig {
             rate_window_secs: default_rate_window_secs(),
             reject_bogon_v4_dst: true,
             reject_reserved_v6_src: true,
+            drop_uid: 0,
+            drop_gid: 0,
         }
     }
 }
