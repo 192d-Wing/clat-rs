@@ -106,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
         config.uplink_interface.clone(),
     ));
 
+    // Drop privileges after state creation (Linux only)
+    if config.security.drop_uid != 0 || config.security.drop_gid != 0 {
+        tun_device::drop_privileges(&tun_device::DropPrivileges {
+            uid: config.security.drop_uid,
+            gid: config.security.drop_gid,
+        })?;
+    }
+
     // Spawn gRPC control server on Unix domain socket
     let socket_path = std::path::PathBuf::from(&cli.grpc_socket);
     let incoming = uds::bind(&socket_path, 0o660)?;

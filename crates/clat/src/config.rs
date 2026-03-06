@@ -87,9 +87,24 @@ pub struct Config {
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 
+    /// Security settings
+    #[serde(default)]
+    pub security: SecurityConfig,
+
     /// XDP acceleration config (optional, requires `--features xdp`)
     #[cfg(all(target_os = "linux", feature = "xdp"))]
     pub xdp: Option<XdpConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct SecurityConfig {
+    /// Drop privileges to this UID after TUN creation (Linux only, 0 = disabled).
+    #[serde(default)]
+    pub drop_uid: u32,
+
+    /// Drop privileges to this GID after TUN creation (Linux only, 0 = disabled).
+    #[serde(default)]
+    pub drop_gid: u32,
 }
 
 fn default_mtu() -> u16 {
@@ -275,5 +290,38 @@ uplink_interface: eth0
         let prefix = config.clat_prefix().unwrap();
         // Explicit clat_v6_prefix should take priority over dhcpv6_pd_prefix
         assert_eq!(prefix, "2001:db8:aaaa::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_security_config_defaults() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+clat_v6_prefix: "2001:db8::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.security.drop_uid, 0);
+        assert_eq!(config.security.drop_gid, 0);
+    }
+
+    #[test]
+    fn test_security_config_overrides() {
+        let yaml = r#"
+clat_ipv4_addr: 192.168.1.1
+clat_ipv4_networks:
+  - "192.168.1.0/24"
+clat_v6_prefix: "2001:db8::/96"
+plat_v6_prefix: "64:ff9b::/96"
+uplink_interface: eth0
+security:
+  drop_uid: 65534
+  drop_gid: 65534
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.security.drop_uid, 65534);
+        assert_eq!(config.security.drop_gid, 65534);
     }
 }
