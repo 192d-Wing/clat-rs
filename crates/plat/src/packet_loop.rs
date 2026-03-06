@@ -1,11 +1,12 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Config;
 use crate::session::{LookupResult, SessionKey};
 use crate::state::SharedState;
+use crate::tun_device;
 
 const BUF_SIZE: usize = 65536;
 
@@ -19,8 +20,18 @@ const REAP_INTERVAL_SECS: u64 = 30;
 
 /// Run the main PLAT NAT64 packet translation loop.
 pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
-    let v6_sock = create_v6_socket(config).await?;
-    let v4_sock = create_v4_socket(config).await?;
+    // Get first pool address for the IPv4 TUN interface
+    let first_pool_addr = {
+        let nat = state.nat.lock().unwrap();
+        let addrs = nat.pool.addresses();
+        if addrs.is_empty() {
+            anyhow::bail!("IPv4 pool has no addresses");
+        }
+        addrs[0]
+    };
+
+    let mut v6_tun = tun_device::create_v6_tun("plat6", config.mtu)?;
+    let mut v4_tun = tun_device::create_v4_tun("plat4", first_pool_addr, config.mtu)?;
 
     let mut prefix_rx = state.subscribe_prefix();
 
@@ -64,9 +75,9 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
             }
 
-            // Inbound: IPv6 from uplink -> translate to IPv4 -> send on egress
-            result = v6_sock.recv_from(&mut v6_buf) => {
-                let (n, _src_addr) = result?;
+            // Inbound: IPv6 from uplink TUN -> translate to IPv4 -> write to egress TUN
+            result = v6_tun.read(&mut v6_buf) => {
+                let n = result?;
                 if n < IPV6_HDR_LEN {
                     continue;
                 }
@@ -75,15 +86,15 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 if let Some(ipv4_packet) = translate_v6_to_v4(
                     ipv6_packet, nat64_prefix, &state,
                 )
-                    && let Err(e) = send_v4_packet(&v4_sock, &ipv4_packet).await
+                    && let Err(e) = v4_tun.write_all(&ipv4_packet).await
                 {
-                    log::warn!("failed to send IPv4 packet: {e}");
+                    log::warn!("failed to write IPv4 packet to TUN: {e}");
                 }
             }
 
-            // Return: IPv4 from egress -> reverse NAT -> translate to IPv6 -> send on uplink
-            result = v4_sock.recv_from(&mut v4_buf) => {
-                let (n, _src_addr) = result?;
+            // Return: IPv4 from egress TUN -> reverse NAT -> translate to IPv6 -> write to uplink TUN
+            result = v4_tun.read(&mut v4_buf) => {
+                let n = result?;
                 if n < IPV4_HDR_LEN {
                     continue;
                 }
@@ -92,9 +103,9 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 if let Some(ipv6_packet) = translate_v4_to_v6(
                     ipv4_packet, nat64_prefix, &state,
                 )
-                    && let Err(e) = send_v6_packet(&v6_sock, &ipv6_packet).await
+                    && let Err(e) = v6_tun.write_all(&ipv6_packet).await
                 {
-                    log::warn!("failed to send IPv6 packet: {e}");
+                    log::warn!("failed to write IPv6 packet to TUN: {e}");
                 }
             }
 
@@ -484,52 +495,6 @@ fn extract_ports(protocol: u8, payload: &[u8]) -> Option<(u16, u16)> {
         }
         _ => Some((0, 0)),
     }
-}
-
-/// Create the IPv6-facing socket (uplink side).
-async fn create_v6_socket(config: &Config) -> anyhow::Result<UdpSocket> {
-    // Development placeholder — in production this would be a raw socket
-    // with a BPF filter matching the NAT64 prefix on the uplink interface.
-    let sock = UdpSocket::bind("[::]:9865").await?;
-    log::warn!(
-        "using development UDP socket for IPv6 (port 9865, interface {}) — replace with raw socket for production",
-        config.uplink_interface
-    );
-    Ok(sock)
-}
-
-/// Create the IPv4-facing socket (egress side).
-async fn create_v4_socket(config: &Config) -> anyhow::Result<UdpSocket> {
-    // Development placeholder — in production this would be a raw socket
-    // for sending/receiving IPv4 packets.
-    let sock = UdpSocket::bind("0.0.0.0:9866").await?;
-    log::warn!(
-        "using development UDP socket for IPv4 (port 9866, interface {}) — replace with raw socket for production",
-        config.egress_interface()
-    );
-    Ok(sock)
-}
-
-async fn send_v4_packet(sock: &UdpSocket, packet: &[u8]) -> anyhow::Result<()> {
-    if packet.len() < IPV4_HDR_LEN {
-        return Ok(());
-    }
-    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let dst_addr = std::net::SocketAddr::from((dst, 0));
-    sock.send_to(packet, dst_addr).await?;
-    Ok(())
-}
-
-async fn send_v6_packet(sock: &UdpSocket, packet: &[u8]) -> anyhow::Result<()> {
-    if packet.len() < IPV6_HDR_LEN {
-        return Ok(());
-    }
-    let mut dst_bytes = [0u8; 16];
-    dst_bytes.copy_from_slice(&packet[24..40]);
-    let dst = Ipv6Addr::from(dst_bytes);
-    let dst_addr = std::net::SocketAddr::from((dst, 0));
-    sock.send_to(packet, dst_addr).await?;
-    Ok(())
 }
 
 #[cfg(test)]

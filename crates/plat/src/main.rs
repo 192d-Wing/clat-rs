@@ -5,6 +5,7 @@ mod packet_loop;
 mod pool;
 mod session;
 mod state;
+mod tun_device;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
