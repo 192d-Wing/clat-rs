@@ -79,6 +79,13 @@ tasks:
     cmds:
       - cargo install --locked cargo-audit cargo-nextest cargo-llvm-cov
 
+  ci-image:
+    desc: Build and push multi-arch CI container to GHCR
+    vars:
+      IMAGE: ghcr.io/192d-wing/clat-rs/ci:latest
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64 -t {{.IMAGE}} --push container/ci
+
   e2e-test:
     desc: Run end-to-end container tests (Client -> CLAT -> PLAT -> Server)
     cmds:

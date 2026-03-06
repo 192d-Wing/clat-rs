@@ -1,11 +1,6 @@
 name: CI Image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - container/ci/Dockerfile
-      - .github/workflows/ci-image.yml
   workflow_dispatch:
 
 env:
