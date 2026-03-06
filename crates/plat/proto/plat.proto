@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package plat;
+
+service PlatControl {
+  // Update the NAT64 prefix at runtime.
+  rpc SetPrefix(SetPrefixRequest) returns (SetPrefixResponse);
+
+  // Query current daemon status.
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+
+  // List active NAT64 sessions.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+
+  // Flush all active sessions.
+  rpc FlushSessions(FlushSessionsRequest) returns (FlushSessionsResponse);
+}
+
+message SetPrefixRequest {
+  // NAT64 prefix in CIDR notation (e.g., "64:ff9b::/96").
+  string nat64_prefix = 1;
+}
+
+message SetPrefixResponse {
+  // The /96 prefix now active for NAT64 translation.
+  string active_prefix = 1;
+}
+
+message GetStatusRequest {}
+
+message StatusResponse {
+  // Active NAT64 /96 prefix.
+  string nat64_prefix = 1;
+
+  // IPv4 pool addresses in CIDR notation.
+  repeated string ipv4_pool = 2;
+
+  // Number of active NAT64 sessions.
+  uint64 active_sessions = 3;
+
+  // Total packets translated since startup.
+  uint64 total_translations = 4;
+
+  // Whether the packet loop is actively translating.
+  bool translating = 5;
+}
+
+message ListSessionsRequest {
+  // Maximum number of sessions to return (0 = all).
+  uint32 limit = 1;
+}
+
+message ListSessionsResponse {
+  repeated SessionEntry sessions = 1;
+}
+
+message SessionEntry {
+  // Original IPv6 source address.
+  string src_v6 = 1;
+
+  // Mapped IPv4 pool address.
+  string pool_v4 = 2;
+
+  // Mapped external port.
+  uint32 mapped_port = 3;
+
+  // Protocol name (tcp/udp/icmp).
+  string protocol = 4;
+
+  // Seconds since session was created.
+  uint64 age_secs = 5;
+
+  // Seconds since last packet.
+  uint64 idle_secs = 6;
+}
+
+message FlushSessionsRequest {}
+
+message FlushSessionsResponse {
+  // Number of sessions that were flushed.
+  uint64 flushed_count = 1;
+}
