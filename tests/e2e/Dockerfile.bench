@@ -1,0 +1,13 @@
+# Benchmark image: includes traffic generators on top of the runtime image
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    iperf3 \
+    ncat \
+    socat \
+    procps \
+    bc \
+    && rm -rf /var/lib/apt/lists/*

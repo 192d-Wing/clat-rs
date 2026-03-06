@@ -102,6 +102,16 @@ tasks:
     cmds:
       - ./tests/e2e/e2e-test.sh --pcap-only
 
+  bench:
+    desc: Run 464XLAT benchmark suite (throughput, latency percentiles, session scaling)
+    cmds:
+      - ./tests/e2e/bench-test.sh
+
+  bench-keep:
+    desc: Run benchmarks and keep containers running for debugging
+    cmds:
+      - ./tests/e2e/bench-test.sh --keep
+
   clean:
     desc: Clean build artifacts
     cmds:

@@ -1,0 +1,26 @@
+# PLAT benchmark configuration
+#
+# Higher limits for load testing
+
+nat64_prefix: "64:ff9b::/96"
+
+ipv4_pool:
+  - "10.46.1.0/24"
+
+uplink_interface: "eth0"
+
+session:
+  max_sessions: 65536
+  tcp_timeout_secs: 300
+  udp_timeout_secs: 120
+  icmp_timeout_secs: 30
+
+port_range: [1024, 65535]
+
+mtu: 1500
+
+security:
+  reject_bogon_v4_dst: false
+  reject_reserved_v6_src: false
+  max_new_sessions_per_source: 10000
+  rate_window_secs: 1

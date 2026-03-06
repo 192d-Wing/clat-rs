@@ -1,0 +1,86 @@
+# Benchmark overlay for 464XLAT load testing
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.bench.yml up
+#
+# Extends the e2e topology with:
+#   - Higher session/rate limits on PLAT
+#   - iperf3 server on the server container
+#   - Benchmark runner in the client namespace
+
+services:
+  # Override PLAT with benchmark-tuned config
+  plat:
+    volumes:
+      - ./configs/plat-bench.yml:/etc/plat-rs/config.yml:ro
+      - pcap_data:/pcap
+      - grpc_sockets:/run/grpc
+
+  # Override server to also run iperf3
+  server:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.bench
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Add secondary IP for translation-path tests
+        ip addr add 198.51.100.1/32 dev eth0
+
+        # Route return traffic to PLAT pool addresses
+        ip route add 10.46.1.0/24 via 10.46.0.4
+
+        # TCP echo server on port 8080
+        socat TCP-LISTEN:8080,fork,reuseaddr EXEC:cat &
+
+        # UDP echo server on port 8081
+        socat UDP-LISTEN:8081,fork,reuseaddr EXEC:cat &
+
+        # iperf3 server on default port 5201
+        iperf3 -s -D
+
+        # iperf3 server on second port for parallel tests
+        iperf3 -s -p 5202 -D
+
+        echo "server ready (echo + iperf3)"
+        trap "kill %1 %2 2>/dev/null; wait" SIGTERM SIGINT
+        wait
+
+  # Benchmark runner shares CLAT network namespace
+  bench:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.bench
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: "service:clat"
+    volumes:
+      - grpc_sockets:/run/grpc
+      - bench_results:/results
+      - ./run-benchmarks.sh:/run-benchmarks.sh:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Wait for services to be ready
+        sleep 8
+
+        # Set up translation route through clat0
+        if ip link show clat0 >/dev/null 2>&1; then
+            ip route replace 198.51.100.0/24 dev clat0
+            echo "Translation route configured"
+        else
+            echo "ERROR: clat0 not found"
+            exit 1
+        fi
+
+        /run-benchmarks.sh
+    depends_on:
+      - clat
+      - plat
+      - server
+
+volumes:
+  pcap_data:
+  grpc_sockets:
+  bench_results:
