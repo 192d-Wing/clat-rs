@@ -29,7 +29,10 @@ impl XdpProgram {
         Self::write_prefix(&mut bpf, clat_prefix)?;
 
         // Load and attach the XDP program
-        let program: &mut Xdp = bpf.program_mut("clat_xdp").unwrap().try_into()?;
+        let program: &mut Xdp = bpf
+            .program_mut("clat_xdp")
+            .ok_or_else(|| anyhow::anyhow!("eBPF object missing 'clat_xdp' program"))?
+            .try_into()?;
         program.load()?;
 
         let flags = if zero_copy {
@@ -51,7 +54,10 @@ impl XdpProgram {
 
     /// Get a mutable reference to the XSK map for registering AF_XDP sockets.
     pub fn xsk_map(&mut self) -> anyhow::Result<XskMap<aya::maps::MapData>> {
-        let map = self.bpf.take_map("XSKS_MAP").unwrap();
+        let map = self
+            .bpf
+            .take_map("XSKS_MAP")
+            .ok_or_else(|| anyhow::anyhow!("eBPF object missing 'XSKS_MAP' map"))?;
         Ok(XskMap::try_from(map)?)
     }
 
@@ -63,7 +69,10 @@ impl XdpProgram {
             u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]),
         ];
 
-        let mut map: Array<_, u32> = Array::try_from(bpf.map_mut("CLAT_PREFIX").unwrap())?;
+        let mut map: Array<_, u32> = Array::try_from(
+            bpf.map_mut("CLAT_PREFIX")
+                .ok_or_else(|| anyhow::anyhow!("eBPF object missing 'CLAT_PREFIX' map"))?,
+        )?;
 
         // Store as raw big-endian bytes (the BPF program compares raw memory)
         for (i, &word) in words.iter().enumerate() {
