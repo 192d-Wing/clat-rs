@@ -9,9 +9,9 @@ set -uo pipefail
 PASS=0
 FAIL=0
 SKIP=0
-CLAT="10.46.0.3"
-PLAT="10.46.0.4"
 SERVER="10.46.0.5"
+CLAT_SOCK="/run/grpc/clat.sock"
+PLAT_SOCK="/run/grpc/plat.sock"
 # Translation test destination (secondary IP on server, routed through clat0)
 XLAT_DST="198.51.100.1"
 
@@ -26,7 +26,7 @@ echo ""
 
 # ── Test 1: CLAT daemon is running and healthy ─────────────────────
 echo "[Test 1] CLAT daemon health (gRPC GetStatus)"
-CLAT_STATUS=$(clat-rs ctl status --grpc-addr "$CLAT:50051" 2>&1 || true)
+CLAT_STATUS=$(clat-rs ctl status --grpc-socket "$CLAT_SOCK" 2>&1 || true)
 if echo "$CLAT_STATUS" | grep -qi "translating"; then
     pass "CLAT daemon responding on gRPC"
 else
@@ -35,7 +35,7 @@ fi
 
 # ── Test 2: PLAT daemon is running and healthy ─────────────────────
 echo "[Test 2] PLAT daemon health (gRPC GetStatus)"
-PLAT_STATUS=$(plat-rs ctl status --grpc-addr "$PLAT:50052" 2>&1 || true)
+PLAT_STATUS=$(plat-rs ctl status --grpc-socket "$PLAT_SOCK" 2>&1 || true)
 if echo "$PLAT_STATUS" | grep -qi "translating"; then
     pass "PLAT daemon responding on gRPC"
 else
@@ -130,7 +130,7 @@ fi
 
 # ── Test 11: PLAT session table via gRPC ──────────────────────────
 echo "[Test 11] PLAT session table (gRPC ListSessions)"
-SESSIONS=$(plat-rs ctl list-sessions --grpc-addr "$PLAT:50052" --limit 10 2>&1 || true)
+SESSIONS=$(plat-rs ctl list-sessions --grpc-socket "$PLAT_SOCK" --limit 10 2>&1 || true)
 if [ -n "$SESSIONS" ]; then
     pass "PLAT ListSessions gRPC endpoint responding"
 else
@@ -139,11 +139,11 @@ fi
 
 # ── Test 12: CLAT gRPC SetPrefix hot-swap ─────────────────────────
 echo "[Test 12] CLAT gRPC SetPrefix hot-swap"
-SET_RESULT=$(clat-rs ctl set-prefix "2001:db8:aa00::/48" --grpc-addr "$CLAT:50051" 2>&1 || true)
+SET_RESULT=$(clat-rs ctl set-prefix "2001:db8:aa00::/48" --grpc-socket "$CLAT_SOCK" 2>&1 || true)
 if echo "$SET_RESULT" | grep -qi "ok\|derived\|prefix"; then
     pass "CLAT SetPrefix gRPC endpoint responding"
     # Restore original prefix
-    clat-rs ctl set-prefix "fd00:c1a7:c1a7::/48" --grpc-addr "$CLAT:50051" >/dev/null 2>&1 || true
+    clat-rs ctl set-prefix "fd00:c1a7:c1a7::/48" --grpc-socket "$CLAT_SOCK" >/dev/null 2>&1 || true
 else
     fail "CLAT SetPrefix failed: $SET_RESULT"
 fi

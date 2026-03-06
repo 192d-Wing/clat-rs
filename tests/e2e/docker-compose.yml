@@ -40,6 +40,7 @@ services:
     volumes:
       - ./configs/clat.yml:/etc/clat-rs/config.yml:ro
       - pcap_data:/pcap
+      - grpc_sockets:/run/grpc
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -48,7 +49,7 @@ services:
         TCPDUMP_PID=$$!
 
         # Start CLAT daemon
-        clat-rs --config /etc/clat-rs/config.yml --grpc-addr '[::]:50051' &
+        clat-rs --config /etc/clat-rs/config.yml --grpc-socket /run/grpc/clat.sock &
         CLAT_PID=$$!
 
         # Wait for TUN devices to be created
@@ -96,6 +97,7 @@ services:
     volumes:
       - ./configs/plat.yml:/etc/plat-rs/config.yml:ro
       - pcap_data:/pcap
+      - grpc_sockets:/run/grpc
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -104,7 +106,7 @@ services:
         TCPDUMP_PID=$$!
 
         # Start PLAT daemon
-        plat-rs --config /etc/plat-rs/config.yml --grpc-addr '[::]:50052' &
+        plat-rs --config /etc/plat-rs/config.yml --grpc-socket /run/grpc/plat.sock &
         PLAT_PID=$$!
 
         # Wait for TUN devices to be created
@@ -188,6 +190,7 @@ services:
     network_mode: "service:clat"
     volumes:
       - pcap_data:/pcap
+      - grpc_sockets:/run/grpc
       - ./run-tests.sh:/run-tests.sh:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
@@ -215,3 +218,4 @@ services:
 
 volumes:
   pcap_data:
+  grpc_sockets:

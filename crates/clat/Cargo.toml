@@ -32,11 +32,12 @@ tun = { version = "0.8.5", features = ["async", "tokio"] }
 # XDP dependencies (optional, behind "xdp" feature)
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
-libc = { version = "0.2", optional = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = []
-xdp = ["aya", "aya-log", "libc"]
+xdp = ["aya", "aya-log"]
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
