@@ -36,6 +36,7 @@ tasks:
   coverage-lcov:
     desc: Generate LCOV coverage report
     cmds:
+      - mkdir -p target/llvm-cov
       - cargo llvm-cov nextest --lcov --output-path target/llvm-cov/lcov.info
 
   fmt:
