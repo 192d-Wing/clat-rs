@@ -77,7 +77,7 @@ impl PlatControl for PlatControlService {
             .map(|p| format!("{p}/96"))
             .unwrap_or_default();
 
-        let nat = self.state.nat.lock().unwrap();
+        let nat = self.state.nat.lock().unwrap_or_else(|e| e.into_inner());
         let pool_addrs: Vec<String> = nat.pool.addresses().iter().map(|a| a.to_string()).collect();
         let active_sessions = nat.sessions.len() as u64;
         drop(nat);
@@ -115,7 +115,7 @@ impl PlatControl for PlatControlService {
             limit = limit,
             "gRPC ListSessions called"
         );
-        let nat = self.state.nat.lock().unwrap();
+        let nat = self.state.nat.lock().unwrap_or_else(|e| e.into_inner());
         let sessions = nat.sessions.list_sessions(limit);
         drop(nat);
 
@@ -139,7 +139,7 @@ impl PlatControl for PlatControlService {
         &self,
         _request: Request<FlushSessionsRequest>,
     ) -> Result<Response<FlushSessionsResponse>, Status> {
-        let mut nat = self.state.nat.lock().unwrap();
+        let mut nat = self.state.nat.lock().unwrap_or_else(|e| e.into_inner());
         let crate::state::NatState { sessions, pool, .. } = &mut *nat;
         let flushed = sessions.flush_all(pool);
         drop(nat);

@@ -204,7 +204,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
             // Periodic session reaping and rate limiter cleanup
             _ = reap_interval.tick() => {
-                let mut nat = state.nat.lock().unwrap();
+                let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
                 let crate::state::NatState {
                     sessions, pool, rate_limiter,
                 } = &mut *nat;
@@ -238,7 +238,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     // Graceful shutdown: flush all sessions and return pool bindings
     state.set_translating(false);
     let flushed = {
-        let mut nat = state.nat.lock().unwrap();
+        let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         let crate::state::NatState { sessions, pool, .. } = &mut *nat;
         sessions.flush_all(pool)
     };
@@ -350,7 +350,7 @@ fn translate_v6_to_v4(
 
     // Look up or create session (with per-source rate limiting on creation)
     let binding = {
-        let mut nat = state.nat.lock().unwrap();
+        let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         let crate::state::NatState {
             sessions,
             pool,
@@ -631,7 +631,7 @@ fn translate_v4_to_v6(
 
     // Reverse lookup: the IPv4 dst is our pool address, dst_port is mapped_port
     let (fwd_key, _binding) = {
-        let mut nat = state.nat.lock().unwrap();
+        let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         nat.sessions
             .reverse_lookup(dst_v4, dst_port, session_proto)?
     };
@@ -849,7 +849,7 @@ fn translate_icmpv6_error_to_v4(
     };
 
     let inner_binding = {
-        let mut nat = state.nat.lock().unwrap();
+        let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         match nat.sessions.lookup(&inner_key) {
             Some(b) => b,
             None => return None, // No existing session for inner flow; drop ICMP error
@@ -1032,7 +1032,7 @@ fn translate_icmpv4_error_to_v6(
     // Reverse lookup: the inner packet was sent BY our PLAT (src=pool, sport=mapped)
     // so we use the inner source address/port for reverse lookup.
     let (fwd_key, _binding) = {
-        let mut nat = state.nat.lock().unwrap();
+        let mut nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         nat.sessions
             .reverse_lookup(inner_src_v4, inner_src_port, inner_session_proto)?
     };
@@ -1479,7 +1479,7 @@ mod tests {
 
         // Session should be created
         assert_eq!(state.translation_count(), 1);
-        let nat = state.nat.lock().unwrap();
+        let nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(nat.sessions.len(), 1);
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
 
         assert_eq!(mapped_port1, mapped_port2);
         assert_eq!(state.translation_count(), 2);
-        let nat = state.nat.lock().unwrap();
+        let nat = state.nat.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(nat.sessions.len(), 1); // still one session
     }
 
