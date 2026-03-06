@@ -8,29 +8,25 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.93"
 
 jobs:
   check:
-    name: Check
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/${{ github.repository }}/ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt, clippy, llvm-tools-preview
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install Task
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-
-      - name: Install tools
-        run: task install-tools
 
       - name: Format check
         run: task fmt-check
@@ -55,5 +51,6 @@ jobs:
         with:
           files: target/llvm-cov/lcov.info
           fail_ci_if_error: true
+          flags: ${{ matrix.arch }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
