@@ -74,6 +74,11 @@ tasks:
       - task: audit
       - task: test
 
+  install-tools:
+    desc: Install development tools (cargo-audit, cargo-nextest)
+    cmds:
+      - cargo install cargo-audit cargo-nextest cargo-llvm-cov
+
   clean:
     desc: Clean build artifacts
     cmds:
