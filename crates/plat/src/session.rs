@@ -107,6 +107,15 @@ impl SessionTable {
         }
     }
 
+    /// Look up an existing session without creating a new one.
+    ///
+    /// If the session exists, its `last_seen` timestamp is refreshed.
+    pub fn lookup(&mut self, key: &SessionKey) -> Option<NatBinding> {
+        let binding = self.forward.get_mut(key)?;
+        binding.last_seen = Instant::now();
+        Some(binding.clone())
+    }
+
     /// Look up an existing session or create a new one.
     ///
     /// If the session exists, its `last_seen` timestamp is refreshed.

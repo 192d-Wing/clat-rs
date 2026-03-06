@@ -850,10 +850,9 @@ fn translate_icmpv6_error_to_v4(
 
     let inner_binding = {
         let mut nat = state.nat.lock().unwrap();
-        let crate::state::NatState { sessions, pool, .. } = &mut *nat;
-        match sessions.lookup_or_create(inner_key, pool) {
-            LookupResult::Existing(b) | LookupResult::Created(b) => b,
-            LookupResult::Exhausted => return None,
+        match nat.sessions.lookup(&inner_key) {
+            Some(b) => b,
+            None => return None, // No existing session for inner flow; drop ICMP error
         }
     };
 
