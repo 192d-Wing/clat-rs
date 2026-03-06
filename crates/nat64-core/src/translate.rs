@@ -30,7 +30,7 @@ pub fn ipv4_to_ipv6(
     }
 
     let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if packet.len() < ihl {
+    if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
         return None;
     }
 
@@ -69,6 +69,9 @@ pub fn ipv4_to_ipv6(
     v6_packet.push(0x00);
 
     // Payload Length
+    if payload_len > u16::MAX as usize {
+        return None;
+    }
     v6_packet.extend_from_slice(&(payload_len as u16).to_be_bytes());
 
     // Next Header
@@ -177,6 +180,9 @@ pub fn ipv6_to_ipv4(
         p => p,
     };
 
+    if IPV4_HEADER_MIN_LEN + payload_len > u16::MAX as usize {
+        return None;
+    }
     let total_len = (IPV4_HEADER_MIN_LEN + payload_len) as u16;
 
     // Build IPv4 header
