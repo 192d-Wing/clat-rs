@@ -109,6 +109,11 @@ impl Umem {
     /// # Safety
     /// Caller must ensure `addr` is within bounds and properly aligned.
     pub unsafe fn frame_ptr(&self, addr: u64) -> *mut u8 {
+        debug_assert!(
+            (addr as usize) < self.area_len,
+            "UMEM frame_ptr out of bounds: addr={addr}, area_len={}",
+            self.area_len
+        );
         unsafe { self.area.add(addr as usize) }
     }
 
@@ -117,6 +122,11 @@ impl Umem {
     /// # Safety
     /// Caller must ensure addr + len is within the UMEM region.
     pub unsafe fn frame_slice(&self, addr: u64, len: u32) -> &[u8] {
+        debug_assert!(
+            (addr as usize).saturating_add(len as usize) <= self.area_len,
+            "UMEM frame_slice out of bounds: addr={addr}, len={len}, area_len={}",
+            self.area_len
+        );
         unsafe { std::slice::from_raw_parts(self.area.add(addr as usize), len as usize) }
     }
 
@@ -125,6 +135,12 @@ impl Umem {
     /// # Safety
     /// Caller must ensure addr is within bounds.
     pub unsafe fn frame_slice_mut(&self, addr: u64) -> &mut [u8] {
+        debug_assert!(
+            (addr as usize).saturating_add(self.frame_size as usize) <= self.area_len,
+            "UMEM frame_slice_mut out of bounds: addr={addr}, frame_size={}, area_len={}",
+            self.frame_size,
+            self.area_len
+        );
         unsafe {
             std::slice::from_raw_parts_mut(self.area.add(addr as usize), self.frame_size as usize)
         }
@@ -254,6 +270,7 @@ impl FillRing {
     /// # Safety
     /// `fd` must be a valid AF_XDP socket with UMEM fill ring configured.
     unsafe fn mmap(fd: i32, offset: &XdpRingOffset, size: u32, pgoff: u64) -> io::Result<Self> {
+        assert!(size.is_power_of_two(), "ring size must be a power of two");
         let mmap_len = (offset.desc + (size as u64) * std::mem::size_of::<u64>() as u64) as usize;
         let addr = unsafe {
             libc::mmap(
@@ -323,6 +340,7 @@ impl CompRing {
     /// # Safety
     /// `fd` must be a valid AF_XDP socket with UMEM completion ring configured.
     unsafe fn mmap(fd: i32, offset: &XdpRingOffset, size: u32, pgoff: u64) -> io::Result<Self> {
+        assert!(size.is_power_of_two(), "ring size must be a power of two");
         let mmap_len = (offset.desc + (size as u64) * std::mem::size_of::<u64>() as u64) as usize;
         let addr = unsafe {
             libc::mmap(
@@ -395,6 +413,7 @@ impl RxRing {
     /// # Safety
     /// `fd` must be a valid AF_XDP socket with RX ring configured.
     unsafe fn mmap(fd: i32, offset: &XdpRingOffset, size: u32, pgoff: u64) -> io::Result<Self> {
+        assert!(size.is_power_of_two(), "ring size must be a power of two");
         let mmap_len =
             (offset.desc + (size as u64) * std::mem::size_of::<XdpDesc>() as u64) as usize;
         let addr = unsafe {
@@ -463,6 +482,7 @@ impl TxRing {
     /// # Safety
     /// `fd` must be a valid AF_XDP socket with TX ring configured.
     unsafe fn mmap(fd: i32, offset: &XdpRingOffset, size: u32, pgoff: u64) -> io::Result<Self> {
+        assert!(size.is_power_of_two(), "ring size must be a power of two");
         let mmap_len =
             (offset.desc + (size as u64) * std::mem::size_of::<XdpDesc>() as u64) as usize;
         let addr = unsafe {
