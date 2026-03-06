@@ -22,8 +22,11 @@ tokio = { version = "1.50.0", features = [
     "signal",
     "sync",
 ] }
+hyper-util = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14.5"
 tonic-prost = "0.14.5"
+tower = "0.5"
 tun = { version = "0.8.5", features = ["async", "tokio"] }
 
 # XDP dependencies (optional, behind "xdp" feature)

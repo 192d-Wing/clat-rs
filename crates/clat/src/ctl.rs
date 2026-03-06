@@ -1,12 +1,11 @@
 use crate::grpc::pb::clat_control_client::ClatControlClient;
 use crate::grpc::pb::{GetStatusRequest, SetPrefixRequest};
-
-const DEFAULT_ADDR: &str = "http://[::1]:50051";
+use crate::uds;
 
 /// Run the `ctl set-prefix` subcommand.
-pub async fn set_prefix(addr: &str, pd_prefix: &str) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = ClatControlClient::connect(endpoint.to_string()).await?;
+pub async fn set_prefix(socket_path: &str, pd_prefix: &str) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = ClatControlClient::new(channel);
 
     let response = client
         .set_prefix(SetPrefixRequest {
@@ -20,9 +19,9 @@ pub async fn set_prefix(addr: &str, pd_prefix: &str) -> anyhow::Result<()> {
 }
 
 /// Run the `ctl status` subcommand.
-pub async fn status(addr: &str) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = ClatControlClient::connect(endpoint.to_string()).await?;
+pub async fn status(socket_path: &str) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = ClatControlClient::new(channel);
 
     let response = client.get_status(GetStatusRequest {}).await?;
     let s = response.into_inner();

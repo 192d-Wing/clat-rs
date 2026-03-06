@@ -2,12 +2,11 @@ use crate::grpc::pb::plat_control_client::PlatControlClient;
 use crate::grpc::pb::{
     FlushSessionsRequest, GetStatusRequest, ListSessionsRequest, SetPrefixRequest,
 };
+use crate::uds;
 
-const DEFAULT_ADDR: &str = "http://[::1]:50052";
-
-pub async fn set_prefix(addr: &str, prefix: &str) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = PlatControlClient::connect(endpoint.to_string()).await?;
+pub async fn set_prefix(socket_path: &str, prefix: &str) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = PlatControlClient::new(channel);
 
     let response = client
         .set_prefix(SetPrefixRequest {
@@ -20,9 +19,9 @@ pub async fn set_prefix(addr: &str, prefix: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn status(addr: &str) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = PlatControlClient::connect(endpoint.to_string()).await?;
+pub async fn status(socket_path: &str) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = PlatControlClient::new(channel);
 
     let response = client.get_status(GetStatusRequest {}).await?;
     let s = response.into_inner();
@@ -42,9 +41,9 @@ pub async fn status(addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_sessions(addr: &str, limit: u32) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = PlatControlClient::connect(endpoint.to_string()).await?;
+pub async fn list_sessions(socket_path: &str, limit: u32) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = PlatControlClient::new(channel);
 
     let response = client.list_sessions(ListSessionsRequest { limit }).await?;
     let resp = response.into_inner();
@@ -67,9 +66,9 @@ pub async fn list_sessions(addr: &str, limit: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn flush_sessions(addr: &str) -> anyhow::Result<()> {
-    let endpoint = if addr.is_empty() { DEFAULT_ADDR } else { addr };
-    let mut client = PlatControlClient::connect(endpoint.to_string()).await?;
+pub async fn flush_sessions(socket_path: &str) -> anyhow::Result<()> {
+    let channel = uds::connect(socket_path).await?;
+    let mut client = PlatControlClient::new(channel);
 
     let response = client.flush_sessions(FlushSessionsRequest {}).await?;
     let resp = response.into_inner();

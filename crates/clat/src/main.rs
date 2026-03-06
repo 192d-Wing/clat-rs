@@ -4,10 +4,11 @@ mod grpc;
 mod packet_loop;
 mod state;
 mod tun_device;
+#[cfg(unix)]
+mod uds;
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 mod xdp;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,9 +30,9 @@ struct Cli {
     #[arg(short, long, default_value = "/etc/clat-rs/config.yml", global = true)]
     config: PathBuf,
 
-    /// gRPC listen address
-    #[arg(long, default_value = "[::1]:50051", global = true)]
-    grpc_addr: String,
+    /// gRPC Unix domain socket path
+    #[arg(long, default_value = uds::DEFAULT_SOCKET_PATH, global = true)]
+    grpc_socket: String,
 }
 
 #[derive(Subcommand)]
@@ -66,10 +67,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle ctl subcommands (gRPC client mode)
     if let Some(Commands::Ctl { action }) = cli.command {
-        let addr = format!("http://{}", cli.grpc_addr);
         return match action {
-            CtlAction::SetPrefix { prefix } => ctl::set_prefix(&addr, &prefix).await,
-            CtlAction::Status => ctl::status(&addr).await,
+            CtlAction::SetPrefix { prefix } => ctl::set_prefix(&cli.grpc_socket, &prefix).await,
+            CtlAction::Status => ctl::status(&cli.grpc_socket).await,
         };
     }
 
@@ -106,19 +106,21 @@ async fn main() -> anyhow::Result<()> {
         config.uplink_interface.clone(),
     ));
 
-    // Spawn gRPC control server
-    let grpc_addr: SocketAddr = cli.grpc_addr.parse()?;
+    // Spawn gRPC control server on Unix domain socket
+    let socket_path = std::path::PathBuf::from(&cli.grpc_socket);
+    let incoming = uds::bind(&socket_path, 0o660)?;
     let grpc_state = Arc::clone(&state);
+    let grpc_socket_path = socket_path.clone();
     tokio::spawn(async move {
         let service = ClatControlService::new(grpc_state);
-        tracing::info!("gRPC control server listening on {grpc_addr}");
         if let Err(e) = Server::builder()
             .add_service(ClatControlServer::new(service))
-            .serve(grpc_addr)
+            .serve_with_incoming(incoming)
             .await
         {
             tracing::error!("gRPC server error: {e}");
         }
+        uds::cleanup(&grpc_socket_path);
     });
 
     // Use XDP packet loop when the feature is enabled and xdp config is present
@@ -131,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         let result = handle
             .join()
             .map_err(|_| anyhow::anyhow!("XDP thread panicked"))?;
+        uds::cleanup(&socket_path);
         tracing::info!(
             event_type = "lifecycle",
             action = "shutdown",
@@ -140,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = packet_loop::run(&config, state).await;
+    uds::cleanup(&socket_path);
     tracing::info!(
         event_type = "lifecycle",
         action = "shutdown",
