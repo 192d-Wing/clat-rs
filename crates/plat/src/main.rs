@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::grpc::PlatControlService;
 use crate::grpc::pb::plat_control_server::PlatControlServer;
 use crate::pool::Ipv4Pool;
-use crate::state::SharedState;
+use crate::state::{SecurityPolicy, SharedState, SourceRateLimiter};
 
 #[derive(Parser)]
 #[command(name = "plat-rs", about = "NAT64 PLAT gateway daemon (RFC 6146)")]
@@ -94,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
         config.session.max_sessions,
     );
 
+    let rate_limiter = SourceRateLimiter::new(
+        config.security.max_new_sessions_per_source,
+        config.security.rate_window_secs,
+    );
+
     let state = Arc::new(SharedState::new(
         Some(nat64_prefix),
         config.uplink_interface.clone(),
@@ -101,6 +106,11 @@ async fn main() -> anyhow::Result<()> {
         pool,
         config.session.max_sessions,
         config.session.to_timeouts(),
+        rate_limiter,
+        SecurityPolicy {
+            reject_bogon_v4_dst: config.security.reject_bogon_v4_dst,
+            reject_reserved_v6_src: config.security.reject_reserved_v6_src,
+        },
     ));
 
     // Spawn gRPC control server

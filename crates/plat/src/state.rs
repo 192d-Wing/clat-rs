@@ -1,6 +1,8 @@
-use std::net::Ipv6Addr;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -17,15 +19,104 @@ pub struct SharedState {
     pub total_translations: AtomicU64,
     /// Session table and pool are behind a single Mutex to avoid lock ordering issues.
     pub nat: Mutex<NatState>,
+    /// Security policy for packet validation.
+    pub security: SecurityPolicy,
 }
 
 /// The mutable NAT state protected by a mutex.
 pub struct NatState {
     pub sessions: SessionTable,
     pub pool: Ipv4Pool,
+    pub rate_limiter: SourceRateLimiter,
+}
+
+/// Per-source fixed-window rate limiter for session creation.
+pub struct SourceRateLimiter {
+    /// (window_start, count) per source IPv6 address.
+    counters: HashMap<Ipv6Addr, (Instant, u32)>,
+    /// Max new sessions per source per window.
+    max_per_window: u32,
+    /// Window duration.
+    window: Duration,
+}
+
+impl SourceRateLimiter {
+    pub fn new(max_per_window: u32, window_secs: u64) -> Self {
+        Self {
+            counters: HashMap::new(),
+            max_per_window,
+            window: Duration::from_secs(window_secs),
+        }
+    }
+
+    /// Check whether a source is allowed to create a new session.
+    /// Returns true if allowed (and increments the counter), false if rate-limited.
+    pub fn check_and_increment(&mut self, source: Ipv6Addr) -> bool {
+        let now = Instant::now();
+        let entry = self.counters.entry(source).or_insert((now, 0));
+
+        // Reset window if expired
+        if now.duration_since(entry.0) >= self.window {
+            *entry = (now, 0);
+        }
+
+        if entry.1 >= self.max_per_window {
+            return false;
+        }
+
+        entry.1 += 1;
+        true
+    }
+
+    /// Remove stale entries (called during reaping).
+    pub fn cleanup(&mut self) {
+        let now = Instant::now();
+        let window = self.window;
+        self.counters
+            .retain(|_, (start, _)| now.duration_since(*start) < window * 2);
+    }
+}
+
+/// Bundled security policy settings.
+pub struct SecurityPolicy {
+    pub reject_bogon_v4_dst: bool,
+    pub reject_reserved_v6_src: bool,
+}
+
+/// Check if an IPv6 source address is reserved/invalid for NAT64 traffic.
+pub fn is_reserved_v6_source(addr: Ipv6Addr) -> bool {
+    addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() || is_v4_mapped_v6(addr)
+}
+
+/// Check if an IPv4 address is a bogon (should not appear as NAT64 destination).
+pub fn is_bogon_v4(addr: Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
+        || addr.is_multicast()
+        || is_private_v4(addr)
+        || is_link_local_v4(addr)
+}
+
+fn is_v4_mapped_v6(addr: Ipv6Addr) -> bool {
+    let seg = addr.segments();
+    seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xFFFF
+}
+
+fn is_private_v4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+}
+
+fn is_link_local_v4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 169 && octets[1] == 254
 }
 
 impl SharedState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_prefix: Option<Ipv6Addr>,
         uplink_interface: String,
@@ -33,6 +124,8 @@ impl SharedState {
         pool: Ipv4Pool,
         max_sessions: usize,
         timeouts: SessionTimeouts,
+        rate_limiter: SourceRateLimiter,
+        security: SecurityPolicy,
     ) -> Self {
         let (prefix_tx, prefix_rx) = watch::channel(initial_prefix);
         Self {
@@ -45,7 +138,9 @@ impl SharedState {
             nat: Mutex::new(NatState {
                 sessions: SessionTable::new(max_sessions, timeouts),
                 pool,
+                rate_limiter,
             }),
+            security,
         }
     }
 
@@ -89,6 +184,17 @@ mod tests {
         Ipv4Pool::new(&cidrs, (1024, 65535)).unwrap()
     }
 
+    fn default_rate_limiter() -> SourceRateLimiter {
+        SourceRateLimiter::new(100, 1)
+    }
+
+    fn default_security() -> SecurityPolicy {
+        SecurityPolicy {
+            reject_bogon_v4_dst: true,
+            reject_reserved_v6_src: true,
+        }
+    }
+
     #[test]
     fn test_new_with_prefix() {
         let prefix: Ipv6Addr = "64:ff9b::".parse().unwrap();
@@ -99,6 +205,8 @@ mod tests {
             test_pool(),
             1000,
             SessionTimeouts::default(),
+            default_rate_limiter(),
+            default_security(),
         );
         assert_eq!(state.current_prefix(), Some(prefix));
         assert!(!state.is_translating());
@@ -114,6 +222,8 @@ mod tests {
             test_pool(),
             1000,
             SessionTimeouts::default(),
+            default_rate_limiter(),
+            default_security(),
         );
         assert_eq!(state.current_prefix(), None);
 
@@ -131,6 +241,8 @@ mod tests {
             test_pool(),
             1000,
             SessionTimeouts::default(),
+            default_rate_limiter(),
+            default_security(),
         );
         state.increment_translations();
         state.increment_translations();
@@ -146,9 +258,64 @@ mod tests {
             test_pool(),
             1000,
             SessionTimeouts::default(),
+            default_rate_limiter(),
+            default_security(),
         );
         let nat = state.nat.lock().unwrap();
         assert!(nat.sessions.is_empty());
         assert_eq!(nat.pool.allocated_count(), 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_allows_within_limit() {
+        let mut rl = SourceRateLimiter::new(3, 1);
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(rl.check_and_increment(src));
+        assert!(rl.check_and_increment(src));
+        assert!(rl.check_and_increment(src));
+        assert!(!rl.check_and_increment(src)); // 4th blocked
+    }
+
+    #[test]
+    fn test_rate_limiter_independent_sources() {
+        let mut rl = SourceRateLimiter::new(1, 1);
+        let src1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let src2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        assert!(rl.check_and_increment(src1));
+        assert!(!rl.check_and_increment(src1));
+        assert!(rl.check_and_increment(src2)); // different source OK
+    }
+
+    #[test]
+    fn test_rate_limiter_window_reset() {
+        let mut rl = SourceRateLimiter::new(1, 0); // 0-second window => always expired
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(rl.check_and_increment(src));
+        // Window is 0 seconds so next check should reset
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(rl.check_and_increment(src));
+    }
+
+    #[test]
+    fn test_reserved_v6_source() {
+        assert!(is_reserved_v6_source("::1".parse().unwrap())); // loopback
+        assert!(is_reserved_v6_source("::".parse().unwrap())); // unspecified
+        assert!(is_reserved_v6_source("ff02::1".parse().unwrap())); // multicast
+        assert!(is_reserved_v6_source("::ffff:192.168.1.1".parse().unwrap())); // v4-mapped
+        assert!(!is_reserved_v6_source("2001:db8::1".parse().unwrap())); // normal
+    }
+
+    #[test]
+    fn test_bogon_v4() {
+        assert!(is_bogon_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback
+        assert!(is_bogon_v4(Ipv4Addr::new(10, 0, 0, 1))); // RFC 1918
+        assert!(is_bogon_v4(Ipv4Addr::new(172, 16, 0, 1))); // RFC 1918
+        assert!(is_bogon_v4(Ipv4Addr::new(192, 168, 1, 1))); // RFC 1918
+        assert!(is_bogon_v4(Ipv4Addr::new(169, 254, 1, 1))); // link-local
+        assert!(is_bogon_v4(Ipv4Addr::new(224, 0, 0, 1))); // multicast
+        assert!(is_bogon_v4(Ipv4Addr::new(255, 255, 255, 255))); // broadcast
+        assert!(is_bogon_v4(Ipv4Addr::new(0, 0, 0, 0))); // unspecified
+        assert!(!is_bogon_v4(Ipv4Addr::new(198, 51, 100, 1))); // normal
+        assert!(!is_bogon_v4(Ipv4Addr::new(8, 8, 8, 8))); // normal
     }
 }

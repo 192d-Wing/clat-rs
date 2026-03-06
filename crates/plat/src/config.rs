@@ -34,6 +34,40 @@ pub struct Config {
     /// gRPC listen address
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String,
+
+    /// Security settings
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SecurityConfig {
+    /// Maximum new sessions a single IPv6 source can create per window.
+    #[serde(default = "default_max_new_sessions_per_source")]
+    pub max_new_sessions_per_source: u32,
+
+    /// Window duration in seconds for per-source rate limiting.
+    #[serde(default = "default_rate_window_secs")]
+    pub rate_window_secs: u64,
+
+    /// Reject packets with bogon IPv4 destinations (RFC 1918, loopback, etc.).
+    #[serde(default = "default_true")]
+    pub reject_bogon_v4_dst: bool,
+
+    /// Reject packets with reserved IPv6 sources (loopback, multicast, etc.).
+    #[serde(default = "default_true")]
+    pub reject_reserved_v6_src: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            max_new_sessions_per_source: default_max_new_sessions_per_source(),
+            rate_window_secs: default_rate_window_secs(),
+            reject_bogon_v4_dst: true,
+            reject_reserved_v6_src: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +123,15 @@ fn default_udp_timeout() -> u64 {
 }
 fn default_icmp_timeout() -> u64 {
     60
+}
+fn default_max_new_sessions_per_source() -> u32 {
+    100
+}
+fn default_rate_window_secs() -> u64 {
+    1
+}
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -256,5 +299,40 @@ port_range: [50000, 10000]
         assert_eq!(t.tcp, std::time::Duration::from_secs(60));
         assert_eq!(t.udp, std::time::Duration::from_secs(30));
         assert_eq!(t.icmp, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_security_config_defaults() {
+        let yaml = r#"
+nat64_prefix: "64:ff9b::/96"
+ipv4_pool:
+  - "198.51.100.0/24"
+uplink_interface: eth0
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.security.max_new_sessions_per_source, 100);
+        assert_eq!(config.security.rate_window_secs, 1);
+        assert!(config.security.reject_bogon_v4_dst);
+        assert!(config.security.reject_reserved_v6_src);
+    }
+
+    #[test]
+    fn test_security_config_overrides() {
+        let yaml = r#"
+nat64_prefix: "64:ff9b::/96"
+ipv4_pool:
+  - "198.51.100.0/24"
+uplink_interface: eth0
+security:
+  max_new_sessions_per_source: 50
+  rate_window_secs: 10
+  reject_bogon_v4_dst: false
+  reject_reserved_v6_src: false
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.security.max_new_sessions_per_source, 50);
+        assert_eq!(config.security.rate_window_secs, 10);
+        assert!(!config.security.reject_bogon_v4_dst);
+        assert!(!config.security.reject_reserved_v6_src);
     }
 }

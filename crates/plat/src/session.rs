@@ -209,6 +209,11 @@ impl SessionTable {
         self.forward.is_empty()
     }
 
+    /// Check if a session exists for the given key.
+    pub fn has_session(&self, key: &SessionKey) -> bool {
+        self.forward.contains_key(key)
+    }
+
     /// Collect session info for status reporting.
     pub fn list_sessions(&self, limit: usize) -> Vec<SessionInfo> {
         let iter = self.forward.iter();

@@ -186,11 +186,14 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 }
             }
 
-            // Periodic session reaping
+            // Periodic session reaping and rate limiter cleanup
             _ = reap_interval.tick() => {
                 let mut nat = state.nat.lock().unwrap();
-                let crate::state::NatState { sessions, pool } = &mut *nat;
+                let crate::state::NatState {
+                    sessions, pool, rate_limiter,
+                } = &mut *nat;
                 let reaped = sessions.reap_expired(pool);
+                rate_limiter.cleanup();
                 if reaped > 0 {
                     log::debug!("reaped {reaped} expired sessions");
                 }
@@ -235,6 +238,19 @@ fn translate_v6_to_v4(
     src_bytes.copy_from_slice(&ipv6_packet[8..24]);
     let src_v6 = Ipv6Addr::from(src_bytes);
 
+    // Security: reject reserved IPv6 sources
+    if state.security.reject_reserved_v6_src && crate::state::is_reserved_v6_source(src_v6) {
+        log::debug!("dropping packet with reserved IPv6 source {src_v6}");
+        return None;
+    }
+
+    // Security: reject bogon IPv4 destinations
+    let dst_v4_check = nat64_core::addr::extract_ipv4_from_ipv6(dst_v6);
+    if state.security.reject_bogon_v4_dst && crate::state::is_bogon_v4(dst_v4_check) {
+        log::debug!("dropping packet with bogon IPv4 destination {dst_v4_check}");
+        return None;
+    }
+
     // Parse extension header chain to find Fragment Header and real transport protocol
     let first_nh = ipv6_packet[6];
     let (next_header, payload_offset, frag_info) = parse_ipv6_extensions(ipv6_packet, first_nh);
@@ -268,10 +284,21 @@ fn translate_v6_to_v4(
         dst_port,
     };
 
-    // Look up or create session
+    // Look up or create session (with per-source rate limiting on creation)
     let binding = {
         let mut nat = state.nat.lock().unwrap();
-        let crate::state::NatState { sessions, pool } = &mut *nat;
+        let crate::state::NatState {
+            sessions,
+            pool,
+            rate_limiter,
+        } = &mut *nat;
+
+        // Check rate limit before creating new sessions
+        if !sessions.has_session(&key) && !rate_limiter.check_and_increment(src_v6) {
+            log::warn!("rate limited session creation for {src_v6}");
+            return None;
+        }
+
         match sessions.lookup_or_create(key, pool) {
             LookupResult::Existing(b) | LookupResult::Created(b) => b,
             LookupResult::Exhausted => {
@@ -686,7 +713,7 @@ fn translate_icmpv6_error_to_v4(
 
     let inner_binding = {
         let mut nat = state.nat.lock().unwrap();
-        let crate::state::NatState { sessions, pool } = &mut *nat;
+        let crate::state::NatState { sessions, pool, .. } = &mut *nat;
         match sessions.lookup_or_create(inner_key, pool) {
             LookupResult::Existing(b) | LookupResult::Created(b) => b,
             LookupResult::Exhausted => return None,
@@ -1006,6 +1033,7 @@ mod tests {
     use super::*;
     use crate::pool::Ipv4Pool;
     use crate::session::SessionTimeouts;
+    use crate::state::{SecurityPolicy, SourceRateLimiter};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
 
@@ -1021,6 +1049,11 @@ mod tests {
             pool,
             1000,
             SessionTimeouts::default(),
+            SourceRateLimiter::new(100, 1),
+            SecurityPolicy {
+                reject_bogon_v4_dst: false,
+                reject_reserved_v6_src: false,
+            },
         ))
     }
 
@@ -1542,6 +1575,11 @@ mod tests {
             pool,
             1000, // max_sessions high, pool is the bottleneck
             SessionTimeouts::default(),
+            SourceRateLimiter::new(100, 1),
+            SecurityPolicy {
+                reject_bogon_v4_dst: false,
+                reject_reserved_v6_src: false,
+            },
         ));
 
         let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
@@ -2283,5 +2321,125 @@ mod tests {
         // Should NOT have a Fragment Extension Header — next_header should be TCP directly
         assert_eq!(v6[6], 6); // TCP, not 44 (Fragment)
         assert_eq!(v6.len(), IPV6_HDR_LEN + tcp_data.len()); // no extra 8 bytes
+    }
+
+    // --- Security hardening tests ---
+
+    fn test_state_with_security(
+        max_new_per_source: u32,
+        reject_bogon: bool,
+        reject_reserved: bool,
+    ) -> Arc<SharedState> {
+        let cidrs = vec![(Ipv4Addr::new(198, 51, 100, 1), 32)];
+        let pool = Ipv4Pool::new(&cidrs, (10000, 10100)).unwrap();
+        Arc::new(SharedState::new(
+            Some(NAT64_PREFIX.parse().unwrap()),
+            "eth0".into(),
+            "eth0".into(),
+            pool,
+            1000,
+            SessionTimeouts::default(),
+            SourceRateLimiter::new(max_new_per_source, 1),
+            SecurityPolicy {
+                reject_bogon_v4_dst: reject_bogon,
+                reject_reserved_v6_src: reject_reserved,
+            },
+        ))
+    }
+
+    #[test]
+    fn test_reserved_v6_source_dropped() {
+        let state = test_state_with_security(100, false, true);
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(198, 51, 100, 50));
+
+        // Loopback source
+        let pkt = build_ipv6_tcp_syn("::1".parse().unwrap(), dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Unspecified source
+        let pkt = build_ipv6_tcp_syn("::".parse().unwrap(), dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Multicast source
+        let pkt = build_ipv6_tcp_syn("ff02::1".parse().unwrap(), dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Normal source should pass
+        let pkt = build_ipv6_tcp_syn("2001:db8::1".parse().unwrap(), dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_some());
+    }
+
+    #[test]
+    fn test_bogon_v4_dst_dropped() {
+        let state = test_state_with_security(100, true, false);
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+        // Private 10.0.0.1
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(10, 0, 0, 1));
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Loopback 127.0.0.1
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(127, 0, 0, 1));
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Private 192.168.1.1
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(192, 168, 1, 1));
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Public address should pass
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(198, 51, 100, 50));
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_some());
+    }
+
+    #[test]
+    fn test_rate_limiting_session_creation() {
+        let state = test_state_with_security(3, false, false);
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(198, 51, 100, 50));
+
+        // First 3 sessions should succeed (different src_ports = different sessions)
+        for port in 5000..5003 {
+            let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, port, 80);
+            assert!(
+                translate_v6_to_v4(&pkt, prefix, &state).is_some(),
+                "session {port} should succeed"
+            );
+        }
+
+        // 4th new session from same source should be rate-limited
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5003, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // But re-using an existing session should still work
+        let pkt = build_ipv6_tcp_syn(src_v6, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_some());
+    }
+
+    #[test]
+    fn test_rate_limiting_per_source_independent() {
+        let state = test_state_with_security(1, false, false);
+        let prefix: Ipv6Addr = NAT64_PREFIX.parse().unwrap();
+        let dst_v6 = nat64_core::addr::embed_ipv4_in_ipv6(prefix, Ipv4Addr::new(198, 51, 100, 50));
+
+        // Source 1 gets 1 session
+        let src1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let pkt = build_ipv6_tcp_syn(src1, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_some());
+
+        // Source 1 blocked on 2nd new session
+        let pkt = build_ipv6_tcp_syn(src1, dst_v6, 5001, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_none());
+
+        // Source 2 is independent and should succeed
+        let src2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let pkt = build_ipv6_tcp_syn(src2, dst_v6, 5000, 80);
+        assert!(translate_v6_to_v4(&pkt, prefix, &state).is_some());
     }
 }

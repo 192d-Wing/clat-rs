@@ -107,7 +107,7 @@ impl PlatControl for PlatControlService {
         _request: Request<FlushSessionsRequest>,
     ) -> Result<Response<FlushSessionsResponse>, Status> {
         let mut nat = self.state.nat.lock().unwrap();
-        let crate::state::NatState { sessions, pool } = &mut *nat;
+        let crate::state::NatState { sessions, pool, .. } = &mut *nat;
         let flushed = sessions.flush_all(pool);
         drop(nat);
 
