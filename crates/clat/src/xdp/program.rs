@@ -20,9 +20,9 @@ impl XdpProgram {
     ) -> anyhow::Result<Self> {
         let mut bpf = Ebpf::load_file(obj_path)?;
 
-        // Set up aya-log forwarding (BPF-side log messages → env_logger)
-        if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
-            log::warn!("failed to init eBPF logger (non-fatal): {e}");
+        // Set up aya-log forwarding (BPF-side log messages → tracing)
+        if let Err(e) = aya_tracing::EbpfLogger::init(&mut bpf) {
+            tracing::warn!("failed to init eBPF logger (non-fatal): {e}");
         }
 
         // Write the CLAT /96 prefix into the BPF map
@@ -39,7 +39,7 @@ impl XdpProgram {
         };
         program.attach(iface, flags)?;
 
-        log::info!("XDP program attached to {iface} (flags={flags:?})");
+        tracing::info!("XDP program attached to {iface} (flags={flags:?})");
 
         Ok(XdpProgram { bpf })
     }
@@ -70,14 +70,14 @@ impl XdpProgram {
             map.set(i as u32, word.to_be(), 0)?;
         }
 
-        log::info!("CLAT prefix written to BPF map: {prefix}/96");
+        tracing::info!("CLAT prefix written to BPF map: {prefix}/96");
         Ok(())
     }
 }
 
 impl Drop for XdpProgram {
     fn drop(&mut self) {
-        log::info!("detaching XDP program");
+        tracing::info!("detaching XDP program");
         // aya automatically detaches on drop
     }
 }

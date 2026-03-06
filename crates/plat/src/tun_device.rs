@@ -26,7 +26,14 @@ pub fn create_v6_tun(name: &str, mtu: u16) -> anyhow::Result<tun::AsyncDevice> {
 
     let dev = tun::create_as_async(&config)?;
 
-    log::info!("created IPv6 TUN device '{name}' with mtu {mtu}");
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "tun_create",
+        device = name,
+        address_family = "ipv6",
+        mtu = mtu,
+        "created IPv6 TUN device"
+    );
     Ok(dev)
 }
 
@@ -57,7 +64,15 @@ pub fn create_v4_tun(
 
     let dev = tun::create_as_async(&config)?;
 
-    log::info!("created IPv4 TUN device '{name}' with addr {pool_addr} mtu {mtu}");
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "tun_create",
+        device = name,
+        address_family = "ipv4",
+        address = %pool_addr,
+        mtu = mtu,
+        "created IPv4 TUN device"
+    );
     Ok(dev)
 }
 
@@ -102,12 +117,18 @@ pub fn drop_privileges(privs: &DropPrivileges) -> anyhow::Result<()> {
         ));
     }
 
-    log::info!("dropped privileges to uid={} gid={}", privs.uid, privs.gid);
+    tracing::info!(
+        event_type = "security",
+        action = "drop_privileges",
+        uid = privs.uid,
+        gid = privs.gid,
+        "dropped privileges"
+    );
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn drop_privileges(_privs: &DropPrivileges) -> anyhow::Result<()> {
-    log::debug!("privilege dropping not supported on this platform");
+    tracing::debug!("privilege dropping not supported on this platform");
     Ok(())
 }

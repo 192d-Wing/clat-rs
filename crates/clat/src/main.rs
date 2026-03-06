@@ -56,7 +56,11 @@ enum CtlAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    nat64_logging::init(&nat64_logging::LogConfig {
+        component: "clat-rs",
+        syslog: false,
+        log_filter: None,
+    });
 
     let cli = Cli::parse();
 
@@ -70,21 +74,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Daemon mode
-    log::info!("loading config from {}", cli.config.display());
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "startup",
+        config_path = %cli.config.display(),
+        "clat-rs daemon starting"
+    );
     let config = Config::load(&cli.config)?;
 
     let initial_prefix = config.clat_prefix().ok();
     let plat_prefix = config.plat_prefix();
 
     if let Some(prefix) = initial_prefix {
-        log::info!(
+        tracing::info!(
             "CLAT: {} -> {}/96 (PLAT prefix: {}/96)",
             config.clat_ipv4_addr,
             prefix,
             plat_prefix,
         );
     } else {
-        log::info!(
+        tracing::info!(
             "CLAT: {} -> (awaiting prefix via gRPC) (PLAT prefix: {}/96)",
             config.clat_ipv4_addr,
             plat_prefix,
@@ -102,27 +111,39 @@ async fn main() -> anyhow::Result<()> {
     let grpc_state = Arc::clone(&state);
     tokio::spawn(async move {
         let service = ClatControlService::new(grpc_state);
-        log::info!("gRPC control server listening on {grpc_addr}");
+        tracing::info!("gRPC control server listening on {grpc_addr}");
         if let Err(e) = Server::builder()
             .add_service(ClatControlServer::new(service))
             .serve(grpc_addr)
             .await
         {
-            log::error!("gRPC server error: {e}");
+            tracing::error!("gRPC server error: {e}");
         }
     });
 
     // Use XDP packet loop when the feature is enabled and xdp config is present
     #[cfg(all(target_os = "linux", feature = "xdp"))]
     if config.xdp.is_some() {
-        log::info!("XDP acceleration enabled — using AF_XDP packet path");
+        tracing::info!("XDP acceleration enabled — using AF_XDP packet path");
         let xdp_config = config.clone();
         let xdp_state = Arc::clone(&state);
         let handle = std::thread::spawn(move || xdp::run(&xdp_config, xdp_state));
-        return handle
+        let result = handle
             .join()
             .map_err(|_| anyhow::anyhow!("XDP thread panicked"))?;
+        tracing::info!(
+            event_type = "lifecycle",
+            action = "shutdown",
+            "clat-rs daemon stopped (XDP)"
+        );
+        return result;
     }
 
-    packet_loop::run(&config, state).await
+    let result = packet_loop::run(&config, state).await;
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "shutdown",
+        "clat-rs daemon stopped"
+    );
+    result
 }

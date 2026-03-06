@@ -28,12 +28,20 @@ impl ClatControl for ClatControlService {
         request: Request<SetPrefixRequest>,
     ) -> Result<Response<SetPrefixResponse>, Status> {
         let pd_prefix = &request.get_ref().dhcpv6_pd_prefix;
-        log::info!("gRPC SetPrefix called with: {pd_prefix}");
-
         let derived = nat64_core::prefix::derive_first_96_from_pd(pd_prefix)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        let old_prefix = self.state.current_prefix();
         self.state.set_prefix(derived);
+
+        tracing::info!(
+            event_type = "admin",
+            action = "dhcpv6_pd_update",
+            pd_prefix = %pd_prefix,
+            derived_clat_prefix = %format!("{derived}/96"),
+            previous_prefix = %old_prefix.map(|p| format!("{p}/96")).unwrap_or_else(|| "none".into()),
+            "DHCPv6-PD prefix updated via gRPC"
+        );
 
         Ok(Response::new(SetPrefixResponse {
             derived_clat_prefix: format!("{derived}/96"),
@@ -44,6 +52,11 @@ impl ClatControl for ClatControlService {
         &self,
         _request: Request<GetStatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        tracing::debug!(
+            event_type = "admin",
+            action = "get_status",
+            "gRPC GetStatus called"
+        );
         let clat_prefix = self
             .state
             .current_prefix()

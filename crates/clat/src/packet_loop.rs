@@ -30,7 +30,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
     // Log additional networks (routes would be added via ip route in production)
     for (net, prefix) in &networks[1..] {
-        log::info!("additional CLAT network: {net}/{prefix}");
+        tracing::info!("additional CLAT network: {net}/{prefix}");
     }
 
     let send_sock = create_raw_ipv6_send_socket()?;
@@ -40,7 +40,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
     // Wait for initial prefix if not set
     if state.current_prefix().is_none() {
-        log::info!("no CLAT prefix configured — waiting for gRPC SetPrefix...");
+        tracing::info!("no CLAT prefix configured — waiting for gRPC SetPrefix...");
         loop {
             if prefix_rx.changed().await.is_err() {
                 anyhow::bail!("prefix channel closed before a prefix was set");
@@ -52,7 +52,13 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     }
 
     let mut clat_prefix = state.current_prefix().unwrap();
-    log::info!("CLAT packet loop started on {TUN_NAME} with prefix {clat_prefix}");
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "packet_loop_start",
+        tun_device = TUN_NAME,
+        clat_prefix = %clat_prefix,
+        "CLAT packet loop started"
+    );
     state.set_translating(true);
 
     let mut tun_buf = [0u8; BUF_SIZE];
@@ -63,13 +69,13 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
             // Watch for prefix updates (hot-swap)
             result = prefix_rx.changed() => {
                 if result.is_err() {
-                    log::warn!("prefix watch channel closed");
+                    tracing::warn!("prefix watch channel closed");
                     break;
                 }
                 if let Some(new_prefix) = *prefix_rx.borrow_and_update()
                     && new_prefix != clat_prefix
                 {
-                    log::info!("hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
+                    tracing::info!("hot-swapping CLAT prefix: {clat_prefix} -> {new_prefix}");
                     clat_prefix = new_prefix;
                 }
             }
@@ -83,9 +89,16 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 let ipv4_packet = &tun_buf[..n];
 
                 if let Some(ipv6_packet) = nat64_core::translate::ipv4_to_ipv6(ipv4_packet, clat_prefix, plat_prefix)
-                    && let Err(e) = send_ipv6_packet(&send_sock, &ipv6_packet).await
                 {
-                    log::warn!("failed to send IPv6 packet: {e}");
+                    tracing::debug!(
+                        event_type = "translation",
+                        direction = "v4_to_v6",
+                        bytes = ipv6_packet.len(),
+                        "translated IPv4 to IPv6"
+                    );
+                    if let Err(e) = send_ipv6_packet(&send_sock, &ipv6_packet).await {
+                        tracing::warn!("failed to send IPv6 packet: {e}");
+                    }
                 }
             }
 
@@ -98,15 +111,27 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 let ipv6_packet = &raw_buf[..n];
 
                 if let Some(ipv4_packet) = nat64_core::translate::ipv6_to_ipv4(ipv6_packet, clat_prefix, plat_prefix)
-                    && let Err(e) = tun_dev.write_all(&ipv4_packet).await
                 {
-                    log::warn!("failed to write IPv4 packet to TUN: {e}");
+                    tracing::debug!(
+                        event_type = "translation",
+                        direction = "v6_to_v4",
+                        bytes = ipv4_packet.len(),
+                        "translated IPv6 to IPv4"
+                    );
+                    if let Err(e) = tun_dev.write_all(&ipv4_packet).await {
+                        tracing::warn!("failed to write IPv4 packet to TUN: {e}");
+                    }
                 }
             }
 
             // Handle shutdown signal
             _ = tokio::signal::ctrl_c() => {
-                log::info!("received shutdown signal, stopping CLAT");
+                tracing::info!(
+                    event_type = "lifecycle",
+                    action = "packet_loop_stop",
+                    reason = "signal",
+                    "CLAT received shutdown signal"
+                );
                 break;
             }
         }
@@ -134,7 +159,7 @@ async fn create_raw_ipv6_recv_socket() -> anyhow::Result<UdpSocket> {
     // In production, this would be a raw socket with a BPF filter
     // or we'd read from a second TUN/TAP device on the IPv6 side.
     let sock = UdpSocket::bind("[::]:9864").await?;
-    log::warn!(
+    tracing::warn!(
         "using development UDP socket for IPv6 recv (port 9864) — replace with raw socket for production"
     );
     Ok(sock)

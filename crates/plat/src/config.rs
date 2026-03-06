@@ -149,6 +149,22 @@ impl Config {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = serde_yaml_ng::from_str(&contents)?;
         config.validate()?;
+        tracing::debug!(
+            event_type = "config",
+            action = "load",
+            nat64_prefix = %config.nat64_prefix,
+            uplink_interface = %config.uplink_interface,
+            egress_interface = %config.egress_interface(),
+            mtu = config.mtu,
+            port_range_start = config.port_range[0],
+            port_range_end = config.port_range[1],
+            max_sessions = config.session.max_sessions,
+            pool_cidrs = ?config.ipv4_pool,
+            reject_bogon_v4 = config.security.reject_bogon_v4_dst,
+            reject_reserved_v6 = config.security.reject_reserved_v6_src,
+            rate_limit_per_source = config.security.max_new_sessions_per_source,
+            "configuration loaded"
+        );
         Ok(config)
     }
 

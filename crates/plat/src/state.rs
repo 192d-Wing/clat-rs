@@ -183,8 +183,15 @@ impl SharedState {
     }
 
     pub fn set_prefix(&self, prefix: Ipv6Addr) {
-        log::info!("NAT64 prefix updated to {prefix}");
+        let old = self.current_prefix();
         let _ = self.prefix_tx.send(Some(prefix));
+        tracing::info!(
+            event_type = "config",
+            action = "prefix_update",
+            new_prefix = %prefix,
+            previous_prefix = %old.map(|p| p.to_string()).unwrap_or_else(|| "none".into()),
+            "NAT64 prefix updated"
+        );
     }
 
     pub fn is_translating(&self) -> bool {

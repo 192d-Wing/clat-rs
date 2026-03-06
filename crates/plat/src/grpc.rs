@@ -43,12 +43,19 @@ impl PlatControl for PlatControlService {
         request: Request<SetPrefixRequest>,
     ) -> Result<Response<SetPrefixResponse>, Status> {
         let prefix_str = &request.get_ref().nat64_prefix;
-        log::info!("gRPC SetPrefix called with: {prefix_str}");
-
         let prefix = nat64_core::prefix::parse_v6_prefix_96(prefix_str)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        let old_prefix = self.state.current_prefix();
         self.state.set_prefix(prefix);
+
+        tracing::info!(
+            event_type = "admin",
+            action = "set_prefix",
+            new_prefix = %format!("{prefix}/96"),
+            previous_prefix = %old_prefix.map(|p| format!("{p}/96")).unwrap_or_else(|| "none".into()),
+            "NAT64 prefix updated via gRPC"
+        );
 
         Ok(Response::new(SetPrefixResponse {
             active_prefix: format!("{prefix}/96"),
@@ -59,6 +66,11 @@ impl PlatControl for PlatControlService {
         &self,
         _request: Request<GetStatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        tracing::debug!(
+            event_type = "admin",
+            action = "get_status",
+            "gRPC GetStatus called"
+        );
         let nat64_prefix = self
             .state
             .current_prefix()
@@ -97,6 +109,12 @@ impl PlatControl for PlatControlService {
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<ListSessionsResponse>, Status> {
         let limit = request.get_ref().limit as usize;
+        tracing::debug!(
+            event_type = "admin",
+            action = "list_sessions",
+            limit = limit,
+            "gRPC ListSessions called"
+        );
         let nat = self.state.nat.lock().unwrap();
         let sessions = nat.sessions.list_sessions(limit);
         drop(nat);
@@ -126,7 +144,12 @@ impl PlatControl for PlatControlService {
         let flushed = sessions.flush_all(pool);
         drop(nat);
 
-        log::info!("gRPC FlushSessions: flushed {flushed} sessions");
+        tracing::info!(
+            event_type = "admin",
+            action = "flush_sessions",
+            flushed_count = flushed,
+            "gRPC FlushSessions completed"
+        );
 
         Ok(Response::new(FlushSessionsResponse {
             flushed_count: flushed as u64,

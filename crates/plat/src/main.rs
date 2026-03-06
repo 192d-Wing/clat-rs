@@ -65,7 +65,11 @@ enum CtlAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    nat64_logging::init(&nat64_logging::LogConfig {
+        component: "plat-rs",
+        syslog: false,
+        log_filter: None,
+    });
 
     let cli = Cli::parse();
 
@@ -81,14 +85,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Daemon mode
-    log::info!("loading config from {}", cli.config.display());
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "startup",
+        config_path = %cli.config.display(),
+        "plat-rs daemon starting"
+    );
     let config = Config::load(&cli.config)?;
 
     let nat64_prefix = config.nat64_prefix();
     let pool_cidrs = config.parse_ipv4_pool()?;
     let pool = Ipv4Pool::new(&pool_cidrs, (config.port_range[0], config.port_range[1]))?;
 
-    log::info!(
+    tracing::info!(
         "PLAT: NAT64 prefix {nat64_prefix}/96, pool {} addresses, max {} sessions",
         pool.addresses().len(),
         config.session.max_sessions,
@@ -126,15 +135,21 @@ async fn main() -> anyhow::Result<()> {
     let grpc_state = Arc::clone(&state);
     tokio::spawn(async move {
         let service = PlatControlService::new(grpc_state);
-        log::info!("gRPC control server listening on {grpc_addr}");
+        tracing::info!("gRPC control server listening on {grpc_addr}");
         if let Err(e) = Server::builder()
             .add_service(PlatControlServer::new(service))
             .serve(grpc_addr)
             .await
         {
-            log::error!("gRPC server error: {e}");
+            tracing::error!("gRPC server error: {e}");
         }
     });
 
-    packet_loop::run(&config, state).await
+    let result = packet_loop::run(&config, state).await;
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "shutdown",
+        "plat-rs daemon stopped"
+    );
+    result
 }

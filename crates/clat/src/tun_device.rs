@@ -27,12 +27,14 @@ pub fn create_tun(
 
     let dev = tun::create_as_async(&config)?;
 
-    log::info!(
-        "created TUN device '{}' with addr {} netmask {} mtu {}",
-        name,
-        addr,
-        prefix_to_netmask(prefix_len),
-        mtu,
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "tun_create",
+        device = name,
+        address = %addr,
+        netmask = %prefix_to_netmask(prefix_len),
+        mtu = mtu,
+        "created CLAT TUN device"
     );
 
     Ok(dev)

@@ -85,7 +85,7 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    log::info!(
+    tracing::info!(
         "XDP packet loop started: queue={queue_id} iface={iface} zero_copy={}",
         xdp_cfg.zero_copy
     );
@@ -106,7 +106,7 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
         if let Ok(true) = prefix_rx.has_changed() {
             if let Some(new_prefix) = *prefix_rx.borrow_and_update() {
                 if new_prefix != current_prefix {
-                    log::info!("hot-swapping CLAT prefix: {current_prefix} -> {new_prefix}");
+                    tracing::info!("hot-swapping CLAT prefix: {current_prefix} -> {new_prefix}");
                     xdp_prog.update_prefix(new_prefix)?;
                     current_prefix = new_prefix;
                 }
@@ -125,6 +125,13 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
                 if let Some(ipv4_pkt) =
                     nat64_core::translate::ipv6_to_ipv4(ipv6_pkt, current_prefix, plat_prefix)
                 {
+                    tracing::debug!(
+                        event_type = "translation",
+                        direction = "v6_to_v4",
+                        path = "xdp",
+                        bytes = ipv4_pkt.len(),
+                        "XDP: translated IPv6 to IPv4"
+                    );
                     let _ = tun_dev.write(&ipv4_pkt);
                 }
             }
@@ -142,6 +149,13 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
                     if let Some(ipv6_pkt) =
                         nat64_core::translate::ipv4_to_ipv6(ipv4_pkt, current_prefix, plat_prefix)
                     {
+                        tracing::debug!(
+                            event_type = "translation",
+                            direction = "v4_to_v6",
+                            path = "xdp",
+                            bytes = ipv6_pkt.len(),
+                            "XDP: translated IPv4 to IPv6"
+                        );
                         if let Some(addr) = allocator.alloc() {
                             // Write Ethernet header + IPv6 packet into UMEM frame
                             // SAFETY: addr is a valid frame from our allocator
@@ -168,7 +182,7 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    log::warn!("TUN read error: {e}");
+                    tracing::warn!("TUN read error: {e}");
                     break;
                 }
             }
@@ -214,7 +228,7 @@ pub fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
     }
 
     state.set_translating(false);
-    log::info!("XDP packet loop stopped");
+    tracing::info!("XDP packet loop stopped");
     Ok(())
 }
 

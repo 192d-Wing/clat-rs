@@ -101,6 +101,18 @@ impl Config {
         let contents: String = std::fs::read_to_string(path)?;
         let config: Config = serde_yaml_ng::from_str(&contents)?;
         config.validate()?;
+        tracing::debug!(
+            event_type = "config",
+            action = "load",
+            clat_ipv4_addr = %config.clat_ipv4_addr,
+            uplink_interface = %config.uplink_interface,
+            plat_v6_prefix = %config.plat_v6_prefix,
+            mtu = config.mtu,
+            networks = ?config.clat_ipv4_networks,
+            has_clat_prefix = config.clat_v6_prefix.is_some(),
+            has_pd_prefix = config.dhcpv6_pd_prefix.is_some(),
+            "configuration loaded"
+        );
         Ok(config)
     }
 
@@ -137,7 +149,7 @@ impl Config {
         }
         if let Some(ref pd) = self.dhcpv6_pd_prefix {
             let derived = nat64_core::prefix::derive_first_96_from_pd(pd)?;
-            log::info!("derived CLAT /96 prefix {derived} from DHCPv6-PD {pd}");
+            tracing::info!("derived CLAT /96 prefix {derived} from DHCPv6-PD {pd}");
             return Ok(derived);
         }
         anyhow::bail!("either clat_v6_prefix or dhcpv6_pd_prefix must be set")

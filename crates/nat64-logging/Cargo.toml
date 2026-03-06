@@ -1,0 +1,12 @@
+[package]
+name = "nat64-logging"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "NIST-compliant structured JSON logging with syslog forwarding for NAT64 daemons"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-log = "0.2"
+syslog-tracing = "0.3"

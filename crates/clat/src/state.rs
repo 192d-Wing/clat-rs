@@ -40,7 +40,7 @@ impl SharedState {
 
     /// Update the CLAT prefix.
     pub fn set_prefix(&self, prefix: Ipv6Addr) {
-        log::info!("CLAT prefix updated to {prefix}");
+        tracing::info!("CLAT prefix updated to {prefix}");
         // send() only fails if all receivers are dropped, which won't happen.
         let _ = self.prefix_tx.send(Some(prefix));
     }

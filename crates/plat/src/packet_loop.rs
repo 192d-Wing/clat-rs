@@ -118,7 +118,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
 
     // Wait for initial prefix if not set
     if state.current_prefix().is_none() {
-        log::info!("no NAT64 prefix configured — waiting for gRPC SetPrefix...");
+        tracing::info!("no NAT64 prefix configured — waiting for gRPC SetPrefix...");
         loop {
             if prefix_rx.changed().await.is_err() {
                 anyhow::bail!("prefix channel closed before a prefix was set");
@@ -130,7 +130,12 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
     }
 
     let mut nat64_prefix = state.current_prefix().unwrap();
-    log::info!("PLAT packet loop started with NAT64 prefix {nat64_prefix}");
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "packet_loop_start",
+        nat64_prefix = %nat64_prefix,
+        "PLAT packet loop started"
+    );
     state.set_translating(true);
 
     let mut v6_buf = [0u8; BUF_SIZE];
@@ -155,13 +160,13 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
             // Prefix hot-swap
             result = prefix_rx.changed() => {
                 if result.is_err() {
-                    log::warn!("prefix watch channel closed");
+                    tracing::warn!("prefix watch channel closed");
                     break;
                 }
                 if let Some(new_prefix) = *prefix_rx.borrow_and_update()
                     && new_prefix != nat64_prefix
                 {
-                    log::info!("hot-swapping NAT64 prefix: {nat64_prefix} -> {new_prefix}");
+                    tracing::info!("hot-swapping NAT64 prefix: {nat64_prefix} -> {new_prefix}");
                     nat64_prefix = new_prefix;
                 }
             }
@@ -178,7 +183,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 match translate_v6_to_v4(ipv6_packet, nat64_prefix, &state) {
                     Some(ipv4_packet) => {
                         if let Err(e) = v4_tun.write_all(&ipv4_packet).await {
-                            log::warn!("failed to write IPv4 packet to TUN: {e}");
+                            tracing::warn!("failed to write IPv4 packet to TUN: {e}");
                         }
                     }
                     None => {
@@ -203,7 +208,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 )
                     && let Err(e) = v6_tun.write_all(&ipv6_packet).await
                 {
-                    log::warn!("failed to write IPv6 packet to TUN: {e}");
+                    tracing::warn!("failed to write IPv6 packet to TUN: {e}");
                 }
             }
 
@@ -216,19 +221,25 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
                 let reaped = sessions.reap_expired(pool);
                 rate_limiter.cleanup();
                 if reaped > 0 {
-                    log::debug!("reaped {reaped} expired sessions");
+                    tracing::debug!(
+                        event_type = "session",
+                        action = "reap",
+                        reaped_count = reaped,
+                        remaining = sessions.len(),
+                        "reaped expired sessions"
+                    );
                 }
             }
 
             // Shutdown on SIGINT
             _ = tokio::signal::ctrl_c() => {
-                log::info!("received SIGINT, shutting down PLAT");
+                tracing::info!("received SIGINT, shutting down PLAT");
                 break;
             }
 
             // Shutdown on SIGTERM (Unix only)
             _ = sigterm.recv() => {
-                log::info!("received SIGTERM, shutting down PLAT");
+                tracing::info!("received SIGTERM, shutting down PLAT");
                 break;
             }
         }
@@ -241,7 +252,12 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
         let crate::state::NatState { sessions, pool, .. } = &mut *nat;
         sessions.flush_all(pool)
     };
-    log::info!("graceful shutdown complete: flushed {flushed} sessions");
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "shutdown",
+        flushed_sessions = flushed,
+        "graceful shutdown complete"
+    );
     Ok(())
 }
 
@@ -278,7 +294,13 @@ fn translate_v6_to_v4(
 
     // Security: reject reserved IPv6 sources
     if state.security.reject_reserved_v6_src && crate::state::is_reserved_v6_source(src_v6) {
-        log::debug!("dropping packet with reserved IPv6 source {src_v6}");
+        tracing::warn!(
+            event_type = "security",
+            action = "drop",
+            reason = "reserved_v6_source",
+            src_v6 = %src_v6,
+            "dropping packet with reserved IPv6 source"
+        );
         state
             .metrics
             .dropped_reserved_v6
@@ -289,7 +311,13 @@ fn translate_v6_to_v4(
     // Security: reject bogon IPv4 destinations
     let dst_v4_check = nat64_core::addr::extract_ipv4_from_ipv6(dst_v6);
     if state.security.reject_bogon_v4_dst && crate::state::is_bogon_v4(dst_v4_check) {
-        log::debug!("dropping packet with bogon IPv4 destination {dst_v4_check}");
+        tracing::warn!(
+            event_type = "security",
+            action = "drop",
+            reason = "bogon_v4_destination",
+            dst_v4 = %dst_v4_check,
+            "dropping packet with bogon IPv4 destination"
+        );
         state
             .metrics
             .dropped_bogon_v4
@@ -316,7 +344,7 @@ fn translate_v6_to_v4(
     if let Some(ref fi) = frag_info
         && fi.offset != 0
     {
-        log::debug!("dropping non-first IPv6 fragment (offset={})", fi.offset);
+        tracing::debug!("dropping non-first IPv6 fragment (offset={})", fi.offset);
         return None;
     }
 
@@ -341,7 +369,13 @@ fn translate_v6_to_v4(
 
         // Check rate limit before creating new sessions
         if !sessions.has_session(&key) && !rate_limiter.check_and_increment(src_v6) {
-            log::warn!("rate limited session creation for {src_v6}");
+            tracing::warn!(
+                event_type = "security",
+                action = "rate_limit",
+                reason = "session_creation_limit",
+                src_v6 = %src_v6,
+                "rate limited session creation"
+            );
             state
                 .metrics
                 .dropped_rate_limited
@@ -350,9 +384,41 @@ fn translate_v6_to_v4(
         }
 
         match sessions.lookup_or_create(key, pool) {
-            LookupResult::Existing(b) | LookupResult::Created(b) => b,
+            LookupResult::Created(b) => {
+                let active = sessions.len();
+                tracing::debug!(
+                    event_type = "session",
+                    action = "create",
+                    src_v6 = %src_v6,
+                    pool_v4 = %b.pool_addr,
+                    mapped_port = b.mapped_port,
+                    protocol = key.protocol,
+                    active_sessions = active,
+                    "new NAT64 session created"
+                );
+                // Warn when pool usage exceeds 80%
+                let capacity = pool.capacity_per_protocol();
+                if capacity > 0 && pool.allocated_count() * 100 / capacity > 80 {
+                    tracing::warn!(
+                        event_type = "resource",
+                        action = "pool_high_usage",
+                        allocated = pool.allocated_count(),
+                        capacity = capacity,
+                        active_sessions = active,
+                        "IPv4 pool usage exceeds 80%"
+                    );
+                }
+                b
+            }
+            LookupResult::Existing(b) => b,
             LookupResult::Exhausted => {
-                log::warn!("NAT session exhausted for {src_v6}");
+                tracing::warn!(
+                    event_type = "security",
+                    action = "drop",
+                    reason = "session_exhausted",
+                    src_v6 = %src_v6,
+                    "NAT session table exhausted"
+                );
                 state
                     .metrics
                     .dropped_session_exhausted
@@ -492,6 +558,16 @@ fn translate_v6_to_v4(
         .metrics
         .v6_to_v4_translated
         .fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        event_type = "translation",
+        direction = "v6_to_v4",
+        src_v6 = %src_v6,
+        src_v4 = %src_v4,
+        dst_v4 = %dst_v4,
+        protocol = next_header,
+        bytes = pkt.len(),
+        "translated IPv6 to IPv4"
+    );
     Some(pkt)
 }
 
@@ -546,7 +622,7 @@ fn translate_v4_to_v6(
     // Non-first IPv4 fragments don't carry transport headers.
     // Drop them (same as v6→v4 path — full reassembly not implemented).
     if ipv4_frag_offset != 0 {
-        log::debug!(
+        tracing::debug!(
             "dropping non-first IPv4 fragment (offset={})",
             ipv4_frag_offset
         );
@@ -712,6 +788,15 @@ fn translate_v4_to_v6(
         .metrics
         .v4_to_v6_translated
         .fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        event_type = "translation",
+        direction = "v4_to_v6",
+        src_v4 = %src_v4,
+        dst_v6 = %dst_v6,
+        protocol,
+        bytes = pkt.len(),
+        "translated IPv4 to IPv6"
+    );
     Some(pkt)
 }
 
@@ -898,6 +983,17 @@ fn translate_icmpv6_error_to_v4(
         .metrics
         .v6_to_v4_translated
         .fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        event_type = "translation",
+        direction = "v6_to_v4",
+        kind = "icmp_error",
+        src_v6 = %outer_src_v6,
+        dst_v4 = %outer_dst_v4,
+        icmp_type = mapping.icmp_type,
+        icmp_code = mapping.icmp_code,
+        bytes = pkt.len(),
+        "translated ICMPv6 error to ICMPv4"
+    );
     Some(pkt)
 }
 
@@ -1070,6 +1166,17 @@ fn translate_icmpv4_error_to_v6(
         .metrics
         .v4_to_v6_translated
         .fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        event_type = "translation",
+        direction = "v4_to_v6",
+        kind = "icmp_error",
+        src_v4 = %outer_src_v4,
+        dst_v6 = %outer_dst_v6,
+        icmp_type = mapping.icmp_type,
+        icmp_code = mapping.icmp_code,
+        bytes = pkt.len(),
+        "translated ICMPv4 error to ICMPv6"
+    );
     Some(pkt)
 }
 
