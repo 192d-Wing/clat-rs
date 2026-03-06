@@ -1,0 +1,22 @@
+# CLAT e2e test configuration
+#
+# Client-side translator: converts IPv4 from TUN to IPv6 on the network
+
+# IPv4 address assigned to the clat0 TUN interface
+clat_ipv4_addr: "192.168.46.1"
+
+# IPv4 subnets served by this CLAT (TUN side)
+clat_ipv4_networks:
+  - "192.168.46.0/24"
+
+# CLAT-side /96 prefix for source address embedding (RFC 6052)
+clat_v6_prefix: "fd00:c1a7:c1a7::/96"
+
+# PLAT-side /96 prefix for destination address embedding
+plat_v6_prefix: "64:ff9b::/96"
+
+# Network interface for IPv6 uplink
+uplink_interface: "eth0"
+
+# TUN MTU (leave room for IPv6 header overhead)
+mtu: 1400

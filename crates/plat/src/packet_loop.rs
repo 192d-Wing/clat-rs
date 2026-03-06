@@ -101,18 +101,8 @@ fn parse_ipv6_extensions(
 /// new packets, flushes all active sessions (returning pool bindings),
 /// and marks the daemon as no longer translating.
 pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()> {
-    // Get first pool address for the IPv4 TUN interface
-    let first_pool_addr = {
-        let nat = state.nat.lock().unwrap();
-        let addrs = nat.pool.addresses();
-        if addrs.is_empty() {
-            anyhow::bail!("IPv4 pool has no addresses");
-        }
-        addrs[0]
-    };
-
     let mut v6_tun = tun_device::create_v6_tun("plat6", config.mtu)?;
-    let mut v4_tun = tun_device::create_v4_tun("plat4", first_pool_addr, config.mtu)?;
+    let mut v4_tun = tun_device::create_v4_tun("plat4", config.mtu)?;
 
     let mut prefix_rx = state.subscribe_prefix();
 

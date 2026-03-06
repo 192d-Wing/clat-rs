@@ -1,0 +1,33 @@
+# PLAT e2e test configuration
+#
+# Provider-side translator: converts IPv6 to IPv4
+
+# NAT64 well-known prefix (must match CLAT's plat_v6_prefix)
+nat64_prefix: "64:ff9b::/96"
+
+# IPv4 pool for outbound NAT
+ipv4_pool:
+  - "10.46.1.1/32"
+
+# IPv6-facing uplink interface
+uplink_interface: "eth0"
+
+# Session configuration for tests (short timeouts)
+session:
+  max_sessions: 1000
+  tcp_timeout_secs: 60
+  udp_timeout_secs: 30
+  icmp_timeout_secs: 10
+
+# Ephemeral port range
+port_range: [10000, 60000]
+
+# MTU
+mtu: 1500
+
+# Relax security for testing (allow private IPv4 destinations)
+security:
+  reject_bogon_v4_dst: false
+  reject_reserved_v6_src: false
+  max_new_sessions_per_source: 500
+  rate_window_secs: 1

@@ -40,6 +40,35 @@ pub fn create_tun(
     Ok(dev)
 }
 
+/// Create the IPv6-facing TUN device (uplink side).
+///
+/// This device carries translated IPv6 packets to/from the network.
+/// Routing rules must direct CLAT-prefix and NAT64-prefix traffic
+/// through this device.
+pub fn create_v6_tun(name: &str, mtu: u16) -> anyhow::Result<tun::AsyncDevice> {
+    let mut config = Configuration::default();
+
+    config.tun_name(name).mtu(mtu).up();
+
+    #[cfg(target_os = "linux")]
+    config.platform_config(|p| {
+        p.ensure_root_privileges(true);
+    });
+
+    let dev = tun::create_as_async(&config)?;
+
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "tun_create",
+        device = name,
+        address_family = "ipv6",
+        mtu = mtu,
+        "created CLAT IPv6 TUN device"
+    );
+
+    Ok(dev)
+}
+
 /// Convert a prefix length to a netmask (e.g., 24 -> 255.255.255.0).
 fn prefix_to_netmask(prefix_len: u8) -> Ipv4Addr {
     if prefix_len == 0 {

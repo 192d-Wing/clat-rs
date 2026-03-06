@@ -1,5 +1,3 @@
-use std::net::Ipv4Addr;
-
 use tun::Configuration;
 
 /// Configuration for privilege dropping after TUN device creation.
@@ -41,21 +39,16 @@ pub fn create_v6_tun(name: &str, mtu: u16) -> anyhow::Result<tun::AsyncDevice> {
 ///
 /// This device sends translated IPv4 packets out and receives
 /// return IPv4 traffic destined to pool addresses.
-/// The pool addresses are configured on this interface so the
-/// kernel routes return traffic back to us.
-pub fn create_v4_tun(
-    name: &str,
-    pool_addr: Ipv4Addr,
-    mtu: u16,
-) -> anyhow::Result<tun::AsyncDevice> {
+///
+/// The pool address is NOT assigned to this interface. Instead,
+/// external routing rules (e.g., `ip route add <pool>/24 dev plat4`)
+/// must direct return traffic to this device. This avoids the kernel
+/// treating pool-destined packets as local delivery, which would
+/// prevent them from reaching the TUN.
+pub fn create_v4_tun(name: &str, mtu: u16) -> anyhow::Result<tun::AsyncDevice> {
     let mut config = Configuration::default();
 
-    config
-        .tun_name(name)
-        .address(pool_addr)
-        .netmask(Ipv4Addr::new(255, 255, 255, 255))
-        .mtu(mtu)
-        .up();
+    config.tun_name(name).mtu(mtu).up();
 
     #[cfg(target_os = "linux")]
     config.platform_config(|p| {
@@ -69,7 +62,6 @@ pub fn create_v4_tun(
         action = "tun_create",
         device = name,
         address_family = "ipv4",
-        address = %pool_addr,
         mtu = mtu,
         "created IPv4 TUN device"
     );

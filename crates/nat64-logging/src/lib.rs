@@ -21,7 +21,6 @@
 //! ```
 
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 // Re-export so daemons can use `tracing::info!` etc.
 pub use tracing;
@@ -93,20 +92,22 @@ pub fn init(config: &LogConfig<'_>) {
                 .with_ansi(false)
                 .with_writer(syslog);
 
-            tracing_subscriber::registry()
+            let subscriber = tracing_subscriber::registry()
                 .with(env_filter)
                 .with(json_layer!())
-                .with(syslog_layer)
-                .init();
+                .with(syslog_layer);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("failed to set global tracing subscriber");
             return;
         }
         eprintln!("warning: syslog logger already initialized, skipping");
     }
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(env_filter)
-        .with(json_layer!())
-        .init();
+        .with(json_layer!());
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("failed to set global tracing subscriber");
 }
 
 /// Open the libc syslog connection.

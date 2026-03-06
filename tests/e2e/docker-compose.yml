@@ -1,0 +1,217 @@
+# End-to-end test topology:
+#
+#   client ──(shares clat network)── clat (10.46.0.3) ──── plat (10.46.0.4) ──── server (10.46.0.5)
+#
+# The client shares the CLAT's network namespace so it can route IPv4 traffic
+# through the clat0 TUN device, exercising the full translation path:
+#
+#   App IPv4 → clat0 TUN → CLAT translates → clat6 TUN → [IPv6 on wire] →
+#   plat6 TUN → PLAT translates → plat4 TUN → [IPv4 on wire] → Server
+#
+# Packet captures run on every container for validation.
+
+networks:
+  e2e_net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.46.0.0/24
+        - subnet: fd46:e2e::/64
+
+services:
+  clat:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv4.ip_forward=1
+    networks:
+      e2e_net:
+        ipv4_address: 10.46.0.3
+        ipv6_address: fd46:e2e::3
+    volumes:
+      - ./configs/clat.yml:/etc/clat-rs/config.yml:ro
+      - pcap_data:/pcap
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Start packet capture on all interfaces
+        tcpdump -i any -w /pcap/clat.pcap -U &
+        TCPDUMP_PID=$$!
+
+        # Start CLAT daemon
+        clat-rs --config /etc/clat-rs/config.yml --grpc-addr '[::]:50051' &
+        CLAT_PID=$$!
+
+        # Wait for TUN devices to be created
+        echo "Waiting for CLAT TUN devices..."
+        for i in $$(seq 1 30); do
+            if ip link show clat6 >/dev/null 2>&1; then break; fi
+            sleep 0.5
+        done
+
+        if ip link show clat6 >/dev/null 2>&1; then
+            echo "clat6 TUN device ready"
+
+            # Outbound: translated IPv6 → route to PLAT
+            ip -6 route add 64:ff9b::/96 via fd46:e2e::4
+
+            # Inbound: CLAT prefix return traffic → deliver to clat6 TUN
+            ip -6 route add fd00:c1a7:c1a7::/96 dev clat6
+
+            echo "CLAT routing configured"
+        else
+            echo "WARNING: clat6 TUN device not found after timeout"
+        fi
+
+        # Wait for shutdown signal
+        trap "kill $$CLAT_PID $$TCPDUMP_PID 2>/dev/null; wait" SIGTERM SIGINT
+        wait $$CLAT_PID
+
+  plat:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv4.ip_forward=1
+    networks:
+      e2e_net:
+        ipv4_address: 10.46.0.4
+        ipv6_address: fd46:e2e::4
+    volumes:
+      - ./configs/plat.yml:/etc/plat-rs/config.yml:ro
+      - pcap_data:/pcap
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Start packet capture on all interfaces
+        tcpdump -i any -w /pcap/plat.pcap -U &
+        TCPDUMP_PID=$$!
+
+        # Start PLAT daemon
+        plat-rs --config /etc/plat-rs/config.yml --grpc-addr '[::]:50052' &
+        PLAT_PID=$$!
+
+        # Wait for TUN devices to be created
+        echo "Waiting for PLAT TUN devices..."
+        for i in $$(seq 1 30); do
+            if ip link show plat6 >/dev/null 2>&1 && ip link show plat4 >/dev/null 2>&1; then break; fi
+            sleep 0.5
+        done
+
+        if ip link show plat6 >/dev/null 2>&1; then
+            echo "plat6 and plat4 TUN devices ready"
+
+            # Inbound: NAT64 prefix IPv6 → deliver to plat6 TUN
+            ip -6 route add 64:ff9b::/96 dev plat6
+
+            # Outbound: CLAT prefix response IPv6 → route to CLAT
+            ip -6 route add fd00:c1a7:c1a7::/96 via fd46:e2e::3
+
+            # IPv4 return: pool address traffic → deliver to plat4 TUN
+            ip route add 10.46.1.0/24 dev plat4
+
+            # IPv4 outbound: test destination → route to server
+            ip route add 198.51.100.0/24 via 10.46.0.5
+
+            echo "PLAT routing configured"
+        else
+            echo "WARNING: PLAT TUN devices not found after timeout"
+        fi
+
+        # Wait for shutdown signal
+        trap "kill $$PLAT_PID $$TCPDUMP_PID 2>/dev/null; wait" SIGTERM SIGINT
+        wait $$PLAT_PID
+
+  server:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      e2e_net:
+        ipv4_address: 10.46.0.5
+        ipv6_address: fd46:e2e::5
+    volumes:
+      - pcap_data:/pcap
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Start packet capture
+        tcpdump -i any -w /pcap/server.pcap -U &
+        TCPDUMP_PID=$$!
+
+        # Add secondary IP for translation-path tests
+        ip addr add 198.51.100.1/32 dev eth0
+
+        # Route return traffic to PLAT pool address
+        ip route add 10.46.1.0/24 via 10.46.0.4
+
+        # TCP echo server on port 8080 (socat forks per connection)
+        socat TCP-LISTEN:8080,fork,reuseaddr EXEC:cat &
+        ECHO_TCP_PID=$$!
+
+        # UDP echo server on port 8081
+        socat UDP-LISTEN:8081,fork,reuseaddr EXEC:cat &
+        ECHO_UDP_PID=$$!
+
+        # Wait for shutdown signal
+        trap "kill $$ECHO_TCP_PID $$ECHO_UDP_PID $$TCPDUMP_PID 2>/dev/null; wait" SIGTERM SIGINT
+        echo "server ready"
+        wait
+
+  client:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Share CLAT's network namespace so we can route through clat0 TUN
+    network_mode: "service:clat"
+    volumes:
+      - pcap_data:/pcap
+      - ./run-tests.sh:/run-tests.sh:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Wait for services to be ready
+        sleep 5
+
+        # Set up route for translation-path tests through clat0
+        if ip link show clat0 >/dev/null 2>&1; then
+            ip route add 198.51.100.0/24 dev clat0
+            echo "Translation route configured (198.51.100.0/24 → clat0)"
+        else
+            echo "WARNING: clat0 not found — translation tests will be skipped"
+        fi
+
+        # Run the test suite
+        /run-tests.sh
+        TEST_EXIT=$$?
+
+        exit $$TEST_EXIT
+    depends_on:
+      - clat
+      - plat
+      - server
+
+volumes:
+  pcap_data:
