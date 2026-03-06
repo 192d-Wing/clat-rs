@@ -242,4 +242,61 @@ mod tests {
         // Just ensure it doesn't panic and returns something
         let _ = result;
     }
+
+    #[test]
+    fn test_internet_checksum_empty() {
+        let cksum = internet_checksum(&[]);
+        assert_eq!(cksum, 0xFFFF); // complement of 0
+    }
+
+    #[test]
+    fn test_internet_checksum_single_byte() {
+        let cksum = internet_checksum(&[0xFF]);
+        // 0xFF00 -> complement is 0x00FF
+        assert_eq!(cksum, 0x00FF);
+    }
+
+    #[test]
+    fn test_internet_checksum_all_zeros() {
+        let data = [0u8; 20];
+        let cksum = internet_checksum(&data);
+        assert_eq!(cksum, 0xFFFF); // complement of 0
+    }
+
+    #[test]
+    fn test_internet_checksum_all_ones() {
+        let data = [0xFFu8; 20];
+        let cksum = internet_checksum(&data);
+        assert_eq!(cksum, 0x0000); // complement of 0xFFFF
+    }
+
+    #[test]
+    fn test_fold32_multiple_carries() {
+        // fold32 is private, so test via adjust functions with values that
+        // require multiple carry rounds
+        let src4: Ipv4Addr = "255.255.255.255".parse().unwrap();
+        let dst4: Ipv4Addr = "255.255.255.255".parse().unwrap();
+        let src6: Ipv6Addr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+        let dst6: Ipv6Addr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+
+        // Should not panic with extreme values
+        let _ = adjust_checksum_v4_to_v6(0xFFFF, src4, dst4, 255, src6, dst6, 255, 65535);
+        let _ = adjust_checksum_v6_to_v4(0xFFFF, src6, dst6, 255, src4, dst4, 255, 65535);
+    }
+
+    #[test]
+    fn test_ipv4_pseudo_header_sum_all_zeros() {
+        let src = Ipv4Addr::new(0, 0, 0, 0);
+        let dst = Ipv4Addr::new(0, 0, 0, 0);
+        assert_eq!(ipv4_pseudo_header_sum(src, dst, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_ipv6_pseudo_header_sum_large_length() {
+        // Test with a length > 65535 (uses the high 16 bits)
+        let src: Ipv6Addr = "::".parse().unwrap();
+        let dst: Ipv6Addr = "::".parse().unwrap();
+        let sum = ipv6_pseudo_header_sum(src, dst, 0, 0x10000);
+        assert_eq!(sum, 1); // only the upper 16 bits contribute: 1
+    }
 }

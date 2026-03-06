@@ -182,4 +182,69 @@ mod tests {
         assert!(parse_ipv4_cidr("192.168.1.0/33").is_err()); // too long
         assert!(parse_ipv4_cidr("bad/24").is_err()); // bad addr
     }
+
+    #[test]
+    fn test_parse_v6_prefix_96_non_numeric_len() {
+        let err = parse_v6_prefix_96("2001:db8::/abc").unwrap_err();
+        assert!(matches!(err, PrefixError::InvalidPrefixLen(_)));
+    }
+
+    #[test]
+    fn test_derive_first_96_non_numeric_len() {
+        let err = derive_first_96_from_pd("2001:db8::/xyz").unwrap_err();
+        assert!(matches!(err, PrefixError::InvalidPrefixLen(_)));
+    }
+
+    #[test]
+    fn test_parse_ipv4_cidr_non_numeric_len() {
+        let err = parse_ipv4_cidr("192.168.1.0/abc").unwrap_err();
+        assert!(matches!(err, PrefixError::InvalidPrefixLen(_)));
+    }
+
+    #[test]
+    fn test_prefix_error_display() {
+        let e = PrefixError::InvalidFormat("bad".into());
+        assert!(e.to_string().contains("invalid prefix format"));
+
+        let e = PrefixError::UnsupportedPrefixLen { got: 128, max: 96 };
+        assert!(e.to_string().contains("128"));
+        assert!(e.to_string().contains("96"));
+
+        let e = PrefixError::InvalidAddress("bad".parse::<Ipv6Addr>().unwrap_err());
+        assert!(e.to_string().contains("invalid address"));
+
+        let e = PrefixError::InvalidPrefixLen("abc".parse::<u8>().unwrap_err());
+        assert!(e.to_string().contains("invalid prefix length"));
+    }
+
+    #[test]
+    fn test_prefix_error_is_error() {
+        let e: Box<dyn std::error::Error> = Box::new(PrefixError::InvalidFormat("test".into()));
+        assert!(e.to_string().contains("test"));
+    }
+
+    #[test]
+    fn test_derive_first_96_from_non_byte_boundary() {
+        // /52 prefix with bits set beyond the boundary
+        // "2001:db8:abcf:ff00::" — byte 6 is 0xff, /52 keeps top 4 bits → 0xf0
+        let result = derive_first_96_from_pd("2001:db8:abcf:ff00::/52").unwrap();
+        let octets = result.octets();
+        // First 6 bytes (48 bits) preserved
+        assert_eq!(octets[0..6], [0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcf]);
+        // Byte 6: 0xff masked to top 4 bits = 0xf0
+        assert_eq!(octets[6], 0xf0);
+        // Rest up to byte 11 should be zero
+        for &b in &octets[7..12] {
+            assert_eq!(b, 0);
+        }
+        // Bytes 12-15 (embedded IPv4) should be zero
+        assert_eq!(octets[12..16], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_ipv4_cidr_zero_prefix() {
+        let (addr, len) = parse_ipv4_cidr("0.0.0.0/0").unwrap();
+        assert_eq!(addr, Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(len, 0);
+    }
 }

@@ -156,3 +156,230 @@ impl PlatControl for PlatControlService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::Ipv4Pool;
+    use crate::session::SessionTimeouts;
+    use crate::state::{SecurityPolicy, SourceRateLimiter};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn test_state(initial_prefix: Option<Ipv6Addr>) -> Arc<SharedState> {
+        let cidrs = vec![(Ipv4Addr::new(198, 51, 100, 1), 32)];
+        let pool = Ipv4Pool::new(&cidrs, (1024, 65535)).unwrap();
+        Arc::new(SharedState::new(
+            initial_prefix,
+            "eth0".into(),
+            "eth1".into(),
+            pool,
+            1000,
+            SessionTimeouts::default(),
+            SourceRateLimiter::new(100, 1),
+            SecurityPolicy {
+                reject_bogon_v4_dst: true,
+                reject_reserved_v6_src: true,
+            },
+        ))
+    }
+
+    #[test]
+    fn test_protocol_name() {
+        assert_eq!(protocol_name(6), "tcp");
+        assert_eq!(protocol_name(17), "udp");
+        assert_eq!(protocol_name(1), "icmp");
+        assert_eq!(protocol_name(0), "other");
+        assert_eq!(protocol_name(255), "other");
+    }
+
+    #[tokio::test]
+    async fn test_set_prefix_valid() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state.clone());
+
+        let req = Request::new(SetPrefixRequest {
+            nat64_prefix: "64:ff9b::/96".to_string(),
+        });
+        let resp = svc.set_prefix(req).await.unwrap();
+        let inner = resp.into_inner();
+
+        assert_eq!(inner.active_prefix, "64:ff9b::/96");
+        assert!(state.current_prefix().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_set_prefix_invalid() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state.clone());
+
+        let req = Request::new(SetPrefixRequest {
+            nat64_prefix: "not-valid".to_string(),
+        });
+        let result = svc.set_prefix(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_set_prefix_replaces_existing() {
+        let initial: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = test_state(Some(initial));
+        let svc = PlatControlService::new(state.clone());
+
+        let req = Request::new(SetPrefixRequest {
+            nat64_prefix: "2001:db8::/96".to_string(),
+        });
+        svc.set_prefix(req).await.unwrap();
+
+        let new_prefix = state.current_prefix().unwrap();
+        assert_ne!(new_prefix, initial);
+        assert_eq!(new_prefix, "2001:db8::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_status_no_prefix() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state.clone());
+
+        let resp = svc
+            .get_status(Request::new(GetStatusRequest {}))
+            .await
+            .unwrap();
+        let s = resp.into_inner();
+
+        assert_eq!(s.nat64_prefix, "");
+        assert!(!s.translating);
+        assert_eq!(s.active_sessions, 0);
+        assert_eq!(s.total_translations, 0);
+        assert!(s.metrics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_status_with_prefix_and_translations() {
+        let prefix: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = test_state(Some(prefix));
+        state.set_translating(true);
+        state.increment_translations();
+        state.increment_translations();
+        state.increment_translations();
+        let svc = PlatControlService::new(state.clone());
+
+        let resp = svc
+            .get_status(Request::new(GetStatusRequest {}))
+            .await
+            .unwrap();
+        let s = resp.into_inner();
+
+        assert_eq!(s.nat64_prefix, "64:ff9b::/96");
+        assert!(s.translating);
+        assert_eq!(s.total_translations, 3);
+        assert_eq!(s.ipv4_pool, vec!["198.51.100.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_status_metrics_zero_initially() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state);
+
+        let resp = svc
+            .get_status(Request::new(GetStatusRequest {}))
+            .await
+            .unwrap();
+        let m = resp.into_inner().metrics.unwrap();
+
+        assert_eq!(m.v6_to_v4_translated, 0);
+        assert_eq!(m.v4_to_v6_translated, 0);
+        assert_eq!(m.dropped_bogon_v4, 0);
+        assert_eq!(m.dropped_reserved_v6, 0);
+        assert_eq!(m.dropped_rate_limited, 0);
+        assert_eq!(m.dropped_session_exhausted, 0);
+        assert_eq!(m.dropped_prefix_mismatch, 0);
+        assert_eq!(m.dropped_invalid_packet, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_empty() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state);
+
+        let resp = svc
+            .list_sessions(Request::new(ListSessionsRequest { limit: 100 }))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flush_sessions_empty() {
+        let state = test_state(None);
+        let svc = PlatControlService::new(state);
+
+        let resp = svc
+            .flush_sessions(Request::new(FlushSessionsRequest {}))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().flushed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_flush_sessions_with_sessions() {
+        use crate::session::SessionKey;
+
+        let prefix: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = test_state(Some(prefix));
+
+        // Create a session
+        {
+            let mut nat = state.nat.lock().unwrap();
+            let key = SessionKey {
+                src_v6: "2001:db8::1".parse().unwrap(),
+                dst_v6: "64:ff9b::0808:0808".parse().unwrap(),
+                protocol: 6,
+                src_port: 12345,
+                dst_port: 80,
+            };
+            let crate::state::NatState { sessions, pool, .. } = &mut *nat;
+            let _ = sessions.lookup_or_create(key, pool);
+        }
+
+        let svc = PlatControlService::new(state);
+        let resp = svc
+            .flush_sessions(Request::new(FlushSessionsRequest {}))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().flushed_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_with_limit() {
+        use crate::session::SessionKey;
+
+        let prefix: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        let state = test_state(Some(prefix));
+
+        // Create multiple sessions
+        {
+            let mut nat = state.nat.lock().unwrap();
+            let crate::state::NatState { sessions, pool, .. } = &mut *nat;
+            for i in 0..5 {
+                let key = SessionKey {
+                    src_v6: "2001:db8::1".parse().unwrap(),
+                    dst_v6: "64:ff9b::0808:0808".parse().unwrap(),
+                    protocol: 6,
+                    src_port: 10000 + i,
+                    dst_port: 80,
+                };
+                let _ = sessions.lookup_or_create(key, pool);
+            }
+        }
+
+        let svc = PlatControlService::new(state);
+
+        // Limit to 3
+        let resp = svc
+            .list_sessions(Request::new(ListSessionsRequest { limit: 3 }))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().sessions.len(), 3);
+    }
+}

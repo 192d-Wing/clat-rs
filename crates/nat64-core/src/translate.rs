@@ -941,6 +941,254 @@ mod tests {
 
     // --- ICMP too-short payload ---
 
+    // --- Additional edge-case tests for coverage ---
+
+    #[test]
+    fn test_ipv4_to_ipv6_ihl_exceeds_packet() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        // IHL=15 (60 bytes header) but packet is only 20 bytes
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x4F; // version=4, IHL=15
+        pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
+        assert!(ipv4_to_ipv6(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_ttl_zero() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        let mut pkt = make_ipv4_icmp_echo_request(src, dst);
+        pkt[8] = 0; // TTL=0
+        // Recompute header checksum
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (cksum >> 8) as u8;
+        pkt[11] = (cksum & 0xFF) as u8;
+
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+        // hop limit should saturate at 0
+        assert_eq!(v6[7], 0);
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_dst_prefix_mismatch() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let wrong: Ipv6Addr = "2001:db8:ffff::".parse().unwrap();
+
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = PROTO_TCP;
+        pkt[7] = 64;
+        // src matches plat (correct)
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        // dst uses wrong prefix (should be clat)
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(wrong, "5.6.7.8".parse().unwrap()).octets());
+
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_truncated_payload() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+
+        let mut pkt = vec![0u8; 44]; // 40 header + 4 actual payload
+        pkt[0] = 0x60;
+        // Payload length claims 20 but only 4 bytes available
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+        pkt[6] = PROTO_TCP;
+        pkt[7] = 64;
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_unknown_protocol_passthrough() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src_v4: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        let dst_v4: Ipv4Addr = "5.6.7.8".parse().unwrap();
+
+        let payload = [0xCA, 0xFE, 0xBA, 0xBE];
+        let mut pkt = vec![0u8; 44]; // 40 header + 4 payload
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&4u16.to_be_bytes());
+        pkt[6] = 47; // GRE (not TCP/UDP/ICMP)
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, src_v4).octets());
+        pkt[24..40].copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, dst_v4).octets());
+        pkt[40..44].copy_from_slice(&payload);
+
+        let v4 = ipv6_to_ipv4(&pkt, clat, plat).unwrap();
+        assert_eq!(v4[0] >> 4, 4);
+        assert_eq!(v4[9], 47); // GRE preserved
+        assert_eq!(&v4[20..24], &payload);
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_hop_limit_zero() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+
+        let mut pkt = vec![0u8; 44];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&4u16.to_be_bytes());
+        pkt[6] = 47; // GRE
+        pkt[7] = 0; // hop limit = 0
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        let v4 = ipv6_to_ipv4(&pkt, clat, plat).unwrap();
+        assert_eq!(v4[8], 0); // TTL saturates at 0
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_icmpv6_too_short() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+
+        // ICMPv6 payload with only 2 bytes (< 4 minimum)
+        let mut pkt = vec![0u8; 42];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&2u16.to_be_bytes());
+        pkt[6] = PROTO_ICMPV6;
+        pkt[7] = 64;
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        assert!(ipv6_to_ipv4(&pkt, clat, plat).is_none());
+    }
+
+    #[test]
+    fn test_ipv4_to_ipv6_icmp_odd_payload() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let src: Ipv4Addr = "192.168.1.2".parse().unwrap();
+        let dst: Ipv4Addr = "198.51.100.1".parse().unwrap();
+
+        // ICMP echo request with 1 byte of data (odd total payload = 9 bytes)
+        let total_len: u16 = 29; // 20 header + 9 ICMP
+        let mut pkt = vec![0u8; total_len as usize];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = PROTO_ICMP;
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let cksum = checksum::ipv4_header_checksum(&pkt[..20]);
+        pkt[10] = (cksum >> 8) as u8;
+        pkt[11] = (cksum & 0xFF) as u8;
+
+        // ICMP echo request (type=8, code=0)
+        pkt[20] = icmp::ICMPV4_ECHO_REQUEST;
+        pkt[21] = 0;
+        pkt[24] = 0x00; // id
+        pkt[25] = 0x01;
+        pkt[26] = 0x00; // seq
+        pkt[27] = 0x01;
+        pkt[28] = 0xAB; // odd data byte
+        pkt[22] = 0;
+        pkt[23] = 0;
+        let icmp_cksum = checksum::internet_checksum(&pkt[20..]);
+        pkt[22] = (icmp_cksum >> 8) as u8;
+        pkt[23] = (icmp_cksum & 0xFF) as u8;
+
+        let v6 = ipv4_to_ipv6(&pkt, clat, plat).unwrap();
+        assert_eq!(v6[6], PROTO_ICMPV6);
+        // Verify payload length includes the odd byte
+        let payload_len = u16::from_be_bytes([v6[4], v6[5]]);
+        assert_eq!(payload_len, 9);
+    }
+
+    #[test]
+    fn test_adjust_tcp_checksum_short_payload() {
+        // TCP payload shorter than 18 bytes should be a no-op
+        let mut tcp = vec![0u8; 16]; // too short
+        let src4: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let dst4: Ipv4Addr = "2.2.2.2".parse().unwrap();
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = tcp.clone();
+        adjust_tcp_checksum_v4_to_v6(&mut tcp, src4, dst4, 6, src6, dst6, 6);
+        assert_eq!(tcp, original); // unchanged
+    }
+
+    #[test]
+    fn test_adjust_tcp_checksum_v6_to_v4_short_payload() {
+        let mut tcp = vec![0u8; 16];
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let src4: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let dst4: Ipv4Addr = "2.2.2.2".parse().unwrap();
+        let original = tcp.clone();
+        adjust_tcp_checksum_v6_to_v4(&mut tcp, src6, dst6, 6, src4, dst4, 6);
+        assert_eq!(tcp, original);
+    }
+
+    #[test]
+    fn test_adjust_udp_checksum_short_payload() {
+        let mut udp = vec![0u8; 6]; // too short (< 8)
+        let src4: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let dst4: Ipv4Addr = "2.2.2.2".parse().unwrap();
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = udp.clone();
+        adjust_udp_checksum_v4_to_v6(&mut udp, src4, dst4, 17, src6, dst6, 17);
+        assert_eq!(udp, original);
+    }
+
+    #[test]
+    fn test_adjust_udp_checksum_v6_to_v4_short_payload() {
+        let mut udp = vec![0u8; 6];
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let src4: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let dst4: Ipv4Addr = "2.2.2.2".parse().unwrap();
+        let original = udp.clone();
+        adjust_udp_checksum_v6_to_v4(&mut udp, src6, dst6, 17, src4, dst4, 17);
+        assert_eq!(udp, original);
+    }
+
+    #[test]
+    fn test_ipv6_to_ipv4_tos_preserved() {
+        let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();
+        let plat: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+
+        let mut pkt = vec![0u8; 44];
+        // Set traffic class to 0xAB: version(4bits)=6, TC high(4bits)=0xA, TC low(4bits)=0xB, flow label
+        pkt[0] = 0x6A; // version=6, TC high nibble=0xA
+        pkt[1] = 0xB0; // TC low nibble=0xB, flow label=0
+        pkt[4..6].copy_from_slice(&4u16.to_be_bytes());
+        pkt[6] = 47; // GRE
+        pkt[7] = 64;
+        pkt[8..24]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(plat, "1.2.3.4".parse().unwrap()).octets());
+        pkt[24..40]
+            .copy_from_slice(&addr::embed_ipv4_in_ipv6(clat, "5.6.7.8".parse().unwrap()).octets());
+
+        let v4 = ipv6_to_ipv4(&pkt, clat, plat).unwrap();
+        assert_eq!(v4[1], 0xAB); // TOS preserved
+    }
+
     #[test]
     fn test_ipv4_to_ipv6_icmp_too_short() {
         let clat: Ipv6Addr = "2001:db8:aaaa::".parse().unwrap();

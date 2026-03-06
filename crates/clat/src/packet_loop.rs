@@ -182,3 +182,59 @@ async fn send_ipv6_packet(sock: &std::net::UdpSocket, packet: &[u8]) -> anyhow::
     sock.send_to(packet, dst_addr)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_send_ipv6_packet_rejects_short_packet() {
+        let sock = std::net::UdpSocket::bind("[::]:0").unwrap();
+        // Packet shorter than 40 bytes should be silently dropped
+        let short = [0u8; 39];
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(send_ipv6_packet(&sock, &short));
+        assert!(result.is_ok()); // returns Ok, just skips sending
+    }
+
+    #[test]
+    fn test_send_ipv6_packet_empty() {
+        let sock = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(send_ipv6_packet(&sock, &[]));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_send_ipv6_packet_exactly_40_bytes() {
+        // Exactly 40 bytes is the minimum — should attempt to send
+        // Build a minimal "IPv6 header" with a routable destination
+        let mut pkt = [0u8; 40];
+        pkt[0] = 0x60; // version 6
+        // Set destination to ::1 (loopback) at bytes 24..40
+        pkt[39] = 1;
+        let sock = std::net::UdpSocket::bind("[::]:0").unwrap();
+        // This may fail to send (no route, etc.) but should not panic
+        let _result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(send_ipv6_packet(&sock, &pkt));
+    }
+
+    #[test]
+    fn test_create_raw_ipv6_send_socket() {
+        let sock = create_raw_ipv6_send_socket();
+        assert!(sock.is_ok());
+    }
+
+    #[test]
+    fn test_buf_size_constant() {
+        assert_eq!(BUF_SIZE, 65536);
+    }
+
+    #[test]
+    fn test_tun_name_constant() {
+        assert_eq!(TUN_NAME, "clat0");
+    }
+}

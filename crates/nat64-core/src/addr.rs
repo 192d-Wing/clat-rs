@@ -79,4 +79,58 @@ mod tests {
         assert!(matches_prefix_96(addr, prefix));
         assert!(!matches_prefix_96(other, prefix));
     }
+
+    #[test]
+    fn test_embed_all_zeros() {
+        let prefix: Ipv6Addr = "::".parse().unwrap();
+        let ipv4 = Ipv4Addr::new(0, 0, 0, 0);
+        let result = embed_ipv4_in_ipv6(prefix, ipv4);
+        assert_eq!(result, Ipv6Addr::from([0u8; 16]));
+    }
+
+    #[test]
+    fn test_embed_all_ones() {
+        let prefix: Ipv6Addr = "ffff:ffff:ffff:ffff:ffff:ffff::".parse().unwrap();
+        let ipv4 = Ipv4Addr::new(255, 255, 255, 255);
+        let result = embed_ipv4_in_ipv6(prefix, ipv4);
+        assert_eq!(result, Ipv6Addr::from([0xFFu8; 16]));
+    }
+
+    #[test]
+    fn test_extract_from_all_zeros() {
+        let addr: Ipv6Addr = "::".parse().unwrap();
+        assert_eq!(extract_ipv4_from_ipv6(addr), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_extract_ignores_prefix() {
+        // Different prefixes, same embedded IPv4 -> same extraction
+        let a: Ipv6Addr = "2001:db8:aaaa::c0a8:0102".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8:bbbb::c0a8:0102".parse().unwrap();
+        assert_eq!(extract_ipv4_from_ipv6(a), extract_ipv4_from_ipv6(b));
+    }
+
+    #[test]
+    fn test_matches_prefix_all_zeros() {
+        let zero: Ipv6Addr = "::".parse().unwrap();
+        // Any address with first 96 bits = 0 matches
+        assert!(matches_prefix_96("::1.2.3.4".parse().unwrap(), zero));
+        assert!(!matches_prefix_96("::1:0:0:0".parse().unwrap(), zero));
+    }
+
+    #[test]
+    fn test_embed_extract_roundtrip_edge_cases() {
+        let prefix: Ipv6Addr = "64:ff9b::".parse().unwrap();
+        for ipv4 in [
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(255, 255, 255, 255),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(0, 0, 0, 1),
+        ] {
+            let embedded = embed_ipv4_in_ipv6(prefix, ipv4);
+            assert_eq!(extract_ipv4_from_ipv6(embedded), ipv4);
+            assert!(matches_prefix_96(embedded, prefix));
+        }
+    }
 }

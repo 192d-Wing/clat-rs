@@ -77,7 +77,22 @@ tasks:
   install-tools:
     desc: Install development tools (cargo-audit, cargo-nextest)
     cmds:
-      - cargo install cargo-audit cargo-nextest cargo-llvm-cov
+      - cargo install --locked cargo-audit cargo-nextest cargo-llvm-cov
+
+  e2e-test:
+    desc: Run end-to-end container tests (Client -> CLAT -> PLAT -> Server)
+    cmds:
+      - ./tests/e2e/e2e-test.sh
+
+  e2e-test-keep:
+    desc: Run e2e tests and keep containers running for debugging
+    cmds:
+      - ./tests/e2e/e2e-test.sh --keep
+
+  e2e-pcaps:
+    desc: Extract and validate pcaps from a running e2e stack
+    cmds:
+      - ./tests/e2e/e2e-test.sh --pcap-only
 
   clean:
     desc: Clean build artifacts

@@ -132,3 +132,37 @@ pub fn drop_privileges(_privs: &DropPrivileges) -> anyhow::Result<()> {
     tracing::debug!("privilege dropping not supported on this platform");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drop_privileges_struct() {
+        let privs = DropPrivileges {
+            uid: 1000,
+            gid: 1000,
+        };
+        assert_eq!(privs.uid, 1000);
+        assert_eq!(privs.gid, 1000);
+    }
+
+    #[test]
+    fn test_drop_privileges_noop_on_non_linux() {
+        let privs = DropPrivileges {
+            uid: 65534,
+            gid: 65534,
+        };
+        // On macOS (and other non-Linux), this is a no-op
+        let result = drop_privileges(&privs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_drop_privileges_zero_ids() {
+        let privs = DropPrivileges { uid: 0, gid: 0 };
+        let result = drop_privileges(&privs);
+        // On non-Linux, always succeeds regardless of uid/gid
+        assert!(result.is_ok());
+    }
+}
