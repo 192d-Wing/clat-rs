@@ -170,16 +170,22 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
             result = v6_tun.read(&mut v6_buf) => {
                 let n = result?;
                 if n < IPV6_HDR_LEN {
+                    state.metrics.dropped_invalid_packet.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let ipv6_packet = &v6_buf[..n];
 
-                if let Some(ipv4_packet) = translate_v6_to_v4(
-                    ipv6_packet, nat64_prefix, &state,
-                )
-                    && let Err(e) = v4_tun.write_all(&ipv4_packet).await
-                {
-                    log::warn!("failed to write IPv4 packet to TUN: {e}");
+                match translate_v6_to_v4(ipv6_packet, nat64_prefix, &state) {
+                    Some(ipv4_packet) => {
+                        if let Err(e) = v4_tun.write_all(&ipv4_packet).await {
+                            log::warn!("failed to write IPv4 packet to TUN: {e}");
+                        }
+                    }
+                    None => {
+                        // Counter already incremented for specific reasons
+                        // (bogon, reserved, rate-limited, exhausted, prefix mismatch).
+                        // Remaining drops are malformed/unsupported packets.
+                    }
                 }
             }
 
@@ -187,6 +193,7 @@ pub async fn run(config: &Config, state: Arc<SharedState>) -> anyhow::Result<()>
             result = v4_tun.read(&mut v4_buf) => {
                 let n = result?;
                 if n < IPV4_HDR_LEN {
+                    state.metrics.dropped_invalid_packet.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let ipv4_packet = &v4_buf[..n];
@@ -258,6 +265,10 @@ fn translate_v6_to_v4(
     dst_bytes.copy_from_slice(&ipv6_packet[24..40]);
     let dst_v6 = Ipv6Addr::from(dst_bytes);
     if !nat64_core::addr::matches_prefix_96(dst_v6, nat64_prefix) {
+        state
+            .metrics
+            .dropped_prefix_mismatch
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
@@ -268,6 +279,10 @@ fn translate_v6_to_v4(
     // Security: reject reserved IPv6 sources
     if state.security.reject_reserved_v6_src && crate::state::is_reserved_v6_source(src_v6) {
         log::debug!("dropping packet with reserved IPv6 source {src_v6}");
+        state
+            .metrics
+            .dropped_reserved_v6
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
@@ -275,6 +290,10 @@ fn translate_v6_to_v4(
     let dst_v4_check = nat64_core::addr::extract_ipv4_from_ipv6(dst_v6);
     if state.security.reject_bogon_v4_dst && crate::state::is_bogon_v4(dst_v4_check) {
         log::debug!("dropping packet with bogon IPv4 destination {dst_v4_check}");
+        state
+            .metrics
+            .dropped_bogon_v4
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
@@ -323,6 +342,10 @@ fn translate_v6_to_v4(
         // Check rate limit before creating new sessions
         if !sessions.has_session(&key) && !rate_limiter.check_and_increment(src_v6) {
             log::warn!("rate limited session creation for {src_v6}");
+            state
+                .metrics
+                .dropped_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -330,6 +353,10 @@ fn translate_v6_to_v4(
             LookupResult::Existing(b) | LookupResult::Created(b) => b,
             LookupResult::Exhausted => {
                 log::warn!("NAT session exhausted for {src_v6}");
+                state
+                    .metrics
+                    .dropped_session_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -461,6 +488,10 @@ fn translate_v6_to_v4(
     }
 
     state.increment_translations();
+    state
+        .metrics
+        .v6_to_v4_translated
+        .fetch_add(1, Ordering::Relaxed);
     Some(pkt)
 }
 
@@ -677,6 +708,10 @@ fn translate_v4_to_v6(
     }
 
     state.increment_translations();
+    state
+        .metrics
+        .v4_to_v6_translated
+        .fetch_add(1, Ordering::Relaxed);
     Some(pkt)
 }
 
@@ -859,6 +894,10 @@ fn translate_icmpv6_error_to_v4(
     pkt.extend_from_slice(&icmp_hdr);
 
     state.increment_translations();
+    state
+        .metrics
+        .v6_to_v4_translated
+        .fetch_add(1, Ordering::Relaxed);
     Some(pkt)
 }
 
@@ -1027,6 +1066,10 @@ fn translate_icmpv4_error_to_v6(
     pkt.extend_from_slice(&icmpv6);
 
     state.increment_translations();
+    state
+        .metrics
+        .v4_to_v6_translated
+        .fetch_add(1, Ordering::Relaxed);
     Some(pkt)
 }
 

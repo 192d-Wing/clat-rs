@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tonic::{Request, Response, Status};
@@ -12,7 +13,8 @@ pub mod pb {
 use pb::plat_control_server::PlatControl;
 use pb::{
     FlushSessionsRequest, FlushSessionsResponse, GetStatusRequest, ListSessionsRequest,
-    ListSessionsResponse, SessionEntry, SetPrefixRequest, SetPrefixResponse, StatusResponse,
+    ListSessionsResponse, PacketMetrics as PbPacketMetrics, SessionEntry, SetPrefixRequest,
+    SetPrefixResponse, StatusResponse,
 };
 
 pub struct PlatControlService {
@@ -68,12 +70,25 @@ impl PlatControl for PlatControlService {
         let active_sessions = nat.sessions.len() as u64;
         drop(nat);
 
+        let m = &self.state.metrics;
+        let metrics = PbPacketMetrics {
+            v6_to_v4_translated: m.v6_to_v4_translated.load(Ordering::Relaxed),
+            v4_to_v6_translated: m.v4_to_v6_translated.load(Ordering::Relaxed),
+            dropped_bogon_v4: m.dropped_bogon_v4.load(Ordering::Relaxed),
+            dropped_reserved_v6: m.dropped_reserved_v6.load(Ordering::Relaxed),
+            dropped_rate_limited: m.dropped_rate_limited.load(Ordering::Relaxed),
+            dropped_session_exhausted: m.dropped_session_exhausted.load(Ordering::Relaxed),
+            dropped_prefix_mismatch: m.dropped_prefix_mismatch.load(Ordering::Relaxed),
+            dropped_invalid_packet: m.dropped_invalid_packet.load(Ordering::Relaxed),
+        };
+
         Ok(Response::new(StatusResponse {
             nat64_prefix,
             ipv4_pool: pool_addrs,
             active_sessions,
             total_translations: self.state.translation_count(),
             translating: self.state.is_translating(),
+            metrics: Some(metrics),
         }))
     }
 

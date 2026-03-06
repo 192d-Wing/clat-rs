@@ -43,6 +43,35 @@ message StatusResponse {
 
   // Whether the packet loop is actively translating.
   bool translating = 5;
+
+  // Packet metrics.
+  PacketMetrics metrics = 6;
+}
+
+message PacketMetrics {
+  // Packets successfully translated IPv6 -> IPv4.
+  uint64 v6_to_v4_translated = 1;
+
+  // Packets successfully translated IPv4 -> IPv6.
+  uint64 v4_to_v6_translated = 2;
+
+  // Packets dropped: bogon IPv4 destination.
+  uint64 dropped_bogon_v4 = 3;
+
+  // Packets dropped: reserved IPv6 source.
+  uint64 dropped_reserved_v6 = 4;
+
+  // Packets dropped: per-source rate limit exceeded.
+  uint64 dropped_rate_limited = 5;
+
+  // Packets dropped: session table exhausted.
+  uint64 dropped_session_exhausted = 6;
+
+  // Packets dropped: NAT64 prefix mismatch.
+  uint64 dropped_prefix_mismatch = 7;
+
+  // Packets dropped: invalid/malformed.
+  uint64 dropped_invalid_packet = 8;
 }
 
 message ListSessionsRequest {

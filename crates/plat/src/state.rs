@@ -9,6 +9,33 @@ use tokio::sync::watch;
 use crate::pool::Ipv4Pool;
 use crate::session::{SessionTable, SessionTimeouts};
 
+/// Atomic counters for packet drop/translation metrics.
+pub struct PacketMetrics {
+    pub v6_to_v4_translated: AtomicU64,
+    pub v4_to_v6_translated: AtomicU64,
+    pub dropped_bogon_v4: AtomicU64,
+    pub dropped_reserved_v6: AtomicU64,
+    pub dropped_rate_limited: AtomicU64,
+    pub dropped_session_exhausted: AtomicU64,
+    pub dropped_prefix_mismatch: AtomicU64,
+    pub dropped_invalid_packet: AtomicU64,
+}
+
+impl PacketMetrics {
+    fn new() -> Self {
+        Self {
+            v6_to_v4_translated: AtomicU64::new(0),
+            v4_to_v6_translated: AtomicU64::new(0),
+            dropped_bogon_v4: AtomicU64::new(0),
+            dropped_reserved_v6: AtomicU64::new(0),
+            dropped_rate_limited: AtomicU64::new(0),
+            dropped_session_exhausted: AtomicU64::new(0),
+            dropped_prefix_mismatch: AtomicU64::new(0),
+            dropped_invalid_packet: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Shared PLAT daemon state, passed to both the gRPC server and the packet loop.
 pub struct SharedState {
     prefix_tx: watch::Sender<Option<Ipv6Addr>>,
@@ -21,6 +48,8 @@ pub struct SharedState {
     pub nat: Mutex<NatState>,
     /// Security policy for packet validation.
     pub security: SecurityPolicy,
+    /// Packet metrics counters.
+    pub metrics: PacketMetrics,
 }
 
 /// The mutable NAT state protected by a mutex.
@@ -141,6 +170,7 @@ impl SharedState {
                 rate_limiter,
             }),
             security,
+            metrics: PacketMetrics::new(),
         }
     }
 
