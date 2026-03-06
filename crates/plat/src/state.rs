@@ -197,11 +197,11 @@ impl SharedState {
     }
 
     pub fn is_translating(&self) -> bool {
-        self.translating.load(Ordering::Relaxed)
+        self.translating.load(Ordering::Acquire)
     }
 
     pub fn set_translating(&self, val: bool) {
-        self.translating.store(val, Ordering::Relaxed);
+        self.translating.store(val, Ordering::Release);
     }
 
     pub fn increment_translations(&self) {

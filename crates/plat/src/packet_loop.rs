@@ -1187,7 +1187,10 @@ fn extract_ports(protocol: u8, payload: &[u8]) -> Option<(u16, u16)> {
             let id = u16::from_be_bytes([payload[4], payload[5]]);
             Some((id, id))
         }
-        _ => Some((0, 0)),
+        // Unsupported protocols (e.g., AH=51, ESP=50) cannot be meaningfully
+        // translated. Return None to drop rather than creating sessions with
+        // zero-port keys that could collide (M-5).
+        _ => None,
     }
 }
 
