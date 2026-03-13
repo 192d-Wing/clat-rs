@@ -9,7 +9,7 @@ description = "NAT64 PLAT gateway daemon (RFC 6146)"
 nat64-core = { path = "../nat64-core" }
 nat64-logging = { path = "../nat64-logging" }
 anyhow = "1.0.102"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1"
 prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
