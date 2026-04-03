@@ -31,7 +31,7 @@ tower = "0.5"
 tun = { version = "0.8.5", features = ["async", "tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.182"
+libc = "0.2.184"
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
